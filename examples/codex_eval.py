@@ -40,10 +40,59 @@ MANIFEST: dict[str, object] = {
     "pack": {"id": "cyber.webapp", "source": {"kind": "builtin"}},
     "runtime": {"tick": {"mode": "auto", "rate_hz": 1.5}},
     "npc": [
+        # Background HTTP traffic so the request log isn't agent-only.
         {
             "type": "cyber.browsing_user",
             "count": 2,
             "config": {"cadence_ticks": 3, "paths": ["/openapi.json", "/"]},
+        },
+        # Persona-faithful office workers — the dashboard seats them
+        # into rooms by ``role``, renders speech callouts per turn, and
+        # paints attack pulses when the agent hits a service the
+        # personas were just visiting.
+        {
+            "type": "cyber.office_persona",
+            "config": {
+                "name": "Alice",
+                "role": "engineer",
+                "title": "Backend Engineer",
+                "tone": "dry, precise",
+                "colleagues": ["Bob"],
+                "cadence_ticks": 4,
+            },
+        },
+        {
+            "type": "cyber.office_persona",
+            "config": {
+                "name": "Bob",
+                "role": "engineer",
+                "title": "Frontend Engineer",
+                "tone": "warm, curious",
+                "colleagues": ["Alice"],
+                "cadence_ticks": 5,
+            },
+        },
+        {
+            "type": "cyber.office_persona",
+            "config": {
+                "name": "Carol",
+                "role": "it_admin",
+                "title": "Security Engineer",
+                "tone": "calm, methodical",
+                "colleagues": ["Dave"],
+                "cadence_ticks": 4,
+            },
+        },
+        {
+            "type": "cyber.office_persona",
+            "config": {
+                "name": "Dave",
+                "role": "sales",
+                "title": "Account Executive",
+                "tone": "brisk, friendly",
+                "colleagues": ["Carol"],
+                "cadence_ticks": 6,
+            },
         },
     ],
 }
@@ -55,12 +104,26 @@ def main() -> None:
     # 1. Build — produces an admitted snapshot. If a builder LLM is
     # supplied, the task instruction and verifier are LLM-generated
     # against the sampled graph; otherwise both come from templates.
+    # Hand the same Codex backend to NPCs so persona chatter and
+    # task-grounded HTTP traffic flow through one provider.
+    npc_backend = (
+        None
+        if args.no_npc_llm
+        else OR.CodexAgentBackend(
+            backend=OR.CodexBackend(
+                command=args.codex_command,
+                model=args.model,
+                timeout=args.npc_timeout,
+            ),
+        )
+    )
     run = OR.OpenRangeRun(
         OR.RunConfig(
             _resolve_run_root(args),
             dashboard=not args.no_dashboard,
             dashboard_host=args.dashboard_host,
             dashboard_port=args.dashboard_port,
+            npc_agent_backend=npc_backend,
         ),
     )
     builder_llm = (
@@ -204,10 +267,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--builder-timeout", type=float, default=300.0)
     parser.add_argument("--agent-timeout", type=float, default=300.0)
+    parser.add_argument("--npc-timeout", type=float, default=60.0)
     parser.add_argument(
         "--no-builder-llm",
         action="store_true",
         help="Skip Codex enrichment at build — use procedural defaults.",
+    )
+    parser.add_argument(
+        "--no-npc-llm",
+        action="store_true",
+        help=(
+            "Skip the LLM-backed office personas — they require a working "
+            "Codex install. Without a backend they self-mark broken at "
+            "episode start; the dashboard scene still seats them but they "
+            "stay silent."
+        ),
     )
     parser.add_argument("--dashboard-host", default="127.0.0.1")
     parser.add_argument("--dashboard-port", type=int)

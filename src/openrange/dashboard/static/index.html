@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link
-  href="https://fonts.googleapis.com/css2?family=Nunito:wght@500;700;800;900&display=swap"
+  href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
   rel="stylesheet">
 <script
   src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -16,155 +16,164 @@
 <link rel="stylesheet" href="/static/dashboard.css">
 </head>
 <body>
-<div class="sim-stage" id="sim-stage">
+<!-- Full-bleed scene stage. Everything else floats on top. -->
+<div class="stage" id="stage">
   <canvas id="sim-canvas" aria-label="OpenRange episode simulation"></canvas>
+  <div class="label-layer" id="sim-label-layer" aria-hidden="true"></div>
 
-  <div class="sim-overlay sim-panel sim-title">
-    <h1>OpenRange Episode Dashboard</h1>
-    <p id="sim-subtitle">Loading public episode briefing</p>
-  </div>
-
-  <div class="sim-overlay sim-panel sim-clock">
-    <strong id="sim-clock">00:00</strong>
-    <span id="sim-status">Waiting</span>
-  </div>
-
-  <button
-    type="button"
-    class="sim-runs-toggle"
-    id="sim-runs-toggle"
-    aria-expanded="false"
-    aria-controls="sim-runs-drawer"
-    aria-label="Toggle runs sidebar"
-    title="Toggle runs sidebar"
-  ></button>
-
-  <aside
-    class="sim-overlay sim-runs-drawer"
-    id="sim-runs-drawer"
-    aria-hidden="true"
-    aria-label="Runs sidebar"
-  >
-    <header class="sim-runs-head">
-      <div class="sim-panel-title">Runs</div>
-      <span id="sim-runs-count" class="sim-runs-count">0</span>
-    </header>
-    <label class="sim-run-follow">
-      <input type="checkbox" id="sim-run-follow" checked>
-      Follow latest
-    </label>
-    <ul class="sim-runs-list" id="sim-runs-list">
-      <li class="sim-runs-empty">No runs found</li>
-    </ul>
-  </aside>
-
-  <div class="sim-overlay sim-panel sim-event-panel">
-    <div class="sim-panel-title">Live Event Feed</div>
-    <ul class="sim-event-list" id="sim-event-log"></ul>
-  </div>
-
-  <div class="sim-overlay sim-panel sim-actor-panel" id="sim-actor-panel">
-    <div class="sim-actor-head">
-      <div>
-        <h2 id="sim-actor-name">Actor</h2>
-        <p id="sim-actor-role">No actor selected</p>
-      </div>
-      <button class="sim-close" id="sim-actor-close" title="Close">X</button>
+  <!-- Top bar: minimal. Brand · run picker · status · live-clock · play/pause. -->
+  <header class="topbar" id="topbar">
+    <div class="topbar-brand">
+      <span class="topbar-mark"></span>
+      <span class="topbar-name">OpenRange</span>
     </div>
-    <dl class="sim-actor-grid">
-      <dt>Kind</dt><dd id="sim-actor-kind">event</dd>
-      <dt>Events</dt><dd id="sim-actor-events">0</dd>
-      <dt>Targets</dt><dd id="sim-actor-targets">none</dd>
-      <dt>Latest</dt><dd id="sim-actor-latest">No activity yet.</dd>
-    </dl>
-    <div class="sim-panel-title">Recent History</div>
-    <ul class="sim-actor-history" id="sim-actor-history"></ul>
-  </div>
-
-  <div class="sim-overlay sim-panel sim-empty" id="sim-empty">
-    No admitted world is loaded yet. Start an eval dashboard through the environment
-    or launch against a snapshot store.
-  </div>
-
-  <div class="sim-overlay sim-bottom">
-    <div class="sim-panel sim-narrator">
-      <div class="sim-panel-title">Episode Narrator</div>
-      <p class="sim-narrator-text" id="sim-narrator">No episode activity yet.</p>
+    <button
+      class="topbar-pill"
+      id="run-picker-btn"
+      aria-haspopup="listbox"
+      aria-expanded="false"
+      title="Switch active run"
+    >
+      <span class="topbar-pill-label">Run</span>
+      <span class="topbar-pill-value" id="run-picker-current">—</span>
+      <span class="topbar-pill-caret">▾</span>
+    </button>
+    <div class="run-picker-menu" id="run-picker-menu" hidden>
+      <label class="run-picker-follow">
+        <input type="checkbox" id="run-picker-follow" checked>
+        Follow latest run
+      </label>
+      <ul class="run-picker-list" id="run-picker-list"></ul>
     </div>
-
-    <div class="sim-controls" aria-label="Episode controls">
-      <button class="danger" data-action="reset" title="Reset episode">RST</button>
-      <button data-action="pause" title="Pause episode">PAU</button>
-      <button class="primary" data-action="play" title="Play episode">PLY</button>
+    <button
+      class="topbar-pill"
+      id="snapshot-pill"
+      title="Click to inspect this build"
+      data-target-tab="build"
+    >
+      <span class="topbar-pill-label">Snapshot</span>
+      <span class="topbar-pill-value" id="snapshot-pill-value">—</span>
+    </button>
+    <span class="topbar-status" id="topbar-status" data-status="waiting">
+      <span class="topbar-status-dot"></span>
+      <span id="topbar-status-text">Waiting</span>
+    </span>
+    <span class="topbar-spacer"></span>
+    <span class="topbar-clock" id="topbar-clock" title="Episode event count">00</span>
+    <div class="topbar-controls" aria-label="Episode controls">
+      <button class="topbar-btn" data-action="reset" title="Reset episode">⟲</button>
+      <button class="topbar-btn" data-action="pause" title="Pause">‖</button>
+      <button class="topbar-btn primary" data-action="play" title="Play">▶</button>
     </div>
-
-    <div class="sim-panel sim-gauges">
-      <div class="sim-panel-title">Run Health</div>
-      <div class="sim-gauge"><span>Uptime</span><i id="sim-uptime-gauge"></i></div>
-      <div class="sim-gauge"><span>Defense</span><i id="sim-defense-gauge"></i></div>
-      <div class="sim-gauge">
-        <span>Integrity</span><i id="sim-integrity-gauge"></i>
-      </div>
-    </div>
-  </div>
-</div>
-
-<main id="inspector" hidden>
-<div class="shell">
-  <header class="identity">
-    <div class="identity-main">
-      <span class="identity-label">Snapshot</span>
-      <code class="identity-id" id="snapshot-id">—</code>
-    </div>
-    <div class="identity-stats" id="identity-stats"></div>
-    <span class="pill" id="admission-pill">Waiting</span>
   </header>
 
-  <section class="briefing-hero" id="briefing-hero"></section>
+  <!-- Left rail: collapsible. Tabs for Build / World / Lineage / Activity / Actor.
+       Activity is the live event ticker; Actor surfaces when a click hits a character. -->
+  <aside class="rail" id="rail" aria-label="Inspector rail" data-open="false">
+    <nav class="rail-tabs" role="tablist">
+      <button class="rail-tab" role="tab" data-tab="build" title="Build">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7l8-4 8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4"/><path d="M4 17l8 4 8-4"/></svg>
+        <span>Build</span>
+      </button>
+      <button class="rail-tab" role="tab" data-tab="world" title="World">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18"/></svg>
+        <span>World</span>
+      </button>
+      <button class="rail-tab" role="tab" data-tab="lineage" title="Lineage">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="6" cy="6" r="2.4"/><circle cx="18" cy="12" r="2.4"/><circle cx="6" cy="18" r="2.4"/><path d="M8.4 6L15.6 11M8.4 18L15.6 13"/></svg>
+        <span>Lineage</span>
+      </button>
+      <button class="rail-tab" role="tab" data-tab="activity" title="Activity">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg>
+        <span>Activity</span>
+      </button>
+      <button class="rail-tab" role="tab" data-tab="actor" title="Actor" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4.5 5-7 8-7s6.5 2.5 8 7"/></svg>
+        <span>Actor</span>
+      </button>
+    </nav>
+    <div class="rail-body">
+      <button class="rail-close" id="rail-close" title="Close panel">×</button>
 
-  <div class="grid">
-    <section class="card">
-      <header class="card-head">
-        <h2>Tasks</h2>
-        <span class="count" id="task-count">0</span>
-      </header>
-      <div class="card-body" id="tasks"></div>
-    </section>
+      <section class="rail-panel" data-panel="build" hidden>
+        <header class="rail-head">
+          <h2>Build</h2>
+          <span class="rail-sub" id="build-snapshot-id">—</span>
+        </header>
+        <div class="rail-content" id="build-content"></div>
+      </section>
 
-    <section class="card">
-      <header class="card-head">
-        <h2>Admission</h2>
-        <span class="count" id="admission-count">0 / 0</span>
-      </header>
-      <div class="card-body" id="admission"></div>
-    </section>
+      <section class="rail-panel" data-panel="world" hidden>
+        <header class="rail-head">
+          <h2>World</h2>
+          <div class="rail-tabbar" id="world-tabbar">
+            <button class="rail-subtab is-active" data-world-tab="services">Services</button>
+            <button class="rail-subtab" data-world-tab="topology">Topology</button>
+            <button class="rail-subtab" data-world-tab="network">Network</button>
+            <button class="rail-subtab" data-world-tab="cast">Cast</button>
+          </div>
+        </header>
+        <div class="rail-content" id="world-content"></div>
+      </section>
 
-    <section class="card">
-      <header class="card-head">
-        <h2>World</h2>
-        <span class="count" id="world-count">0 services</span>
-      </header>
-      <div class="card-body" id="world"></div>
-    </section>
+      <section class="rail-panel" data-panel="lineage" hidden>
+        <header class="rail-head">
+          <h2>Lineage</h2>
+          <span class="rail-sub" id="lineage-count-sub">0 nodes</span>
+        </header>
+        <div class="rail-content" id="lineage-content"></div>
+      </section>
 
-    <section class="card">
-      <header class="card-head">
-        <h2>Lineage</h2>
-        <span class="count" id="lineage-count">0</span>
-      </header>
-      <div class="card-body" id="lineage"></div>
-    </section>
+      <section class="rail-panel" data-panel="activity" hidden>
+        <header class="rail-head">
+          <h2>Activity</h2>
+          <span class="rail-sub" id="activity-count">0 events</span>
+        </header>
+        <ul class="activity-list" id="activity-list"></ul>
+      </section>
+
+      <section class="rail-panel" data-panel="actor" hidden>
+        <header class="rail-head">
+          <h2 id="actor-name">Actor</h2>
+          <span class="rail-sub" id="actor-role">no actor selected</span>
+        </header>
+        <div class="rail-content" id="actor-content"></div>
+      </section>
+    </div>
+  </aside>
+
+  <!-- Empty-state when no snapshot. -->
+  <div class="empty-state" id="empty-state" hidden>
+    <h1>No admitted world loaded</h1>
+    <p>Run an OpenRange eval against a runs directory; this dashboard tails the live event log.</p>
   </div>
 
-  <section class="card card-wide">
-    <header class="card-head">
-      <h2>Artifacts</h2>
-      <span class="count" id="artifact-count">0</span>
-    </header>
-    <div class="card-body" id="artifacts"></div>
-  </section>
+  <!-- Build banner: slides in when a new lineage node arrives. -->
+  <div class="build-banner" id="build-banner" hidden>
+    <div class="build-banner-icon">⟶</div>
+    <div class="build-banner-body">
+      <div class="build-banner-eyebrow" id="build-banner-eyebrow">New build</div>
+      <div class="build-banner-title" id="build-banner-title">—</div>
+      <div class="build-banner-sub" id="build-banner-sub"></div>
+    </div>
+    <button class="build-banner-cta" id="build-banner-cta">Open</button>
+    <button class="build-banner-dismiss" id="build-banner-dismiss" title="Dismiss">×</button>
+  </div>
+
+  <!-- Toasts: short-lived persona speech / agent action highlights. -->
+  <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+
+  <!-- Footer: tiny health indicators + narrator one-liner. -->
+  <footer class="footbar" id="footbar">
+    <div class="health-pips" title="Run health">
+      <span class="pip" id="pip-uptime" data-label="Uptime"></span>
+      <span class="pip" id="pip-defense" data-label="Defense"></span>
+      <span class="pip" id="pip-integrity" data-label="Integrity"></span>
+    </div>
+    <p class="footbar-narrator" id="footbar-narrator">Waiting for episode activity…</p>
+    <span class="footbar-meta" id="footbar-meta"></span>
+  </footer>
 </div>
-</main>
 <script src="/static/dashboard.js"></script>
 </body>
 </html>

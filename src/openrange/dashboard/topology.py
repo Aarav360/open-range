@@ -78,13 +78,74 @@ def normalized_runtime_topology(snapshot: Snapshot) -> dict[str, object]:
     else:
         zones.extend(zone for zone in service_zones if zone not in zones)
 
+    # Personas: prefer pack-supplied rows, fall back to expanding the
+    # manifest's NPC entries that carry a ``name``/``role`` (the seat
+    # information the dashboard needs to render the office floor on
+    # the first frame, before any tick has fired).
+    personas = normalized_rows(raw.get("green_personas"))
+    if not personas:
+        personas = personas_from_manifest(snapshot.manifest.npc)
+
     return {
         "services": services,
         "edges": normalized_rows(raw.get("edges")),
         "zones": zones,
         "users": normalized_rows(raw.get("users")),
-        "green_personas": normalized_rows(raw.get("green_personas")),
+        "green_personas": personas,
     }
+
+
+def personas_from_manifest(
+    npc_entries: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Expand manifest NPC entries into persona rows for the dashboard.
+
+    Only entries whose config carries a ``name`` are surfaced — those
+    are the explicitly-personaed NPCs the scene knows how to seat.
+    The shape mirrors what the LLM-backed ``office_persona`` NPC emits
+    on its first ``record_action`` (display_name, role, title, tone,
+    home_index): so the scene can place an NPC at its desk without
+    waiting for the first tick to land an event.
+
+    When ``count`` is > 1, the entry is replicated and the ``id`` is
+    suffixed (``"Alice"`` → ``"Alice-1"``, ``"Alice-2"``, ...) so the
+    dashboard can place each spawn at its own desk; ``display_name``
+    keeps the suffix too because the underlying NPC instances all share
+    the bare name and would collide otherwise.
+    """
+    rows: list[dict[str, object]] = []
+    for entry in npc_entries:
+        config = entry.get("config", {})
+        if not isinstance(config, Mapping):
+            continue
+        name = config.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        count_raw = entry.get("count", 1)
+        count = count_raw if isinstance(count_raw, int) and count_raw > 0 else 1
+        role = config.get("role", "engineer")
+        title = config.get("title", "")
+        tone = config.get("tone", "warm, professional")
+        colleagues = config.get("colleagues", ())
+        home = config.get("home")
+        for index in range(count):
+            suffix = "" if count == 1 else f"-{index + 1}"
+            rows.append(
+                {
+                    "id": f"{name}{suffix}",
+                    "display_name": f"{name}{suffix}",
+                    "role": str(role) if isinstance(role, str) else "engineer",
+                    "title": str(title) if isinstance(title, str) else "",
+                    "tone": str(tone) if isinstance(tone, str) else "",
+                    "colleagues": (
+                        [str(c) for c in colleagues if isinstance(c, str)]
+                        if isinstance(colleagues, list | tuple)
+                        else []
+                    ),
+                    "home": str(home) if isinstance(home, str) else None,
+                },
+            )
+    return rows
 
 
 def embedded_topology(snapshot: Snapshot) -> dict[str, object]:

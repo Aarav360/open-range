@@ -363,16 +363,26 @@ def test_dashboard_http_server_serves_static_assets_and_routes(
         assert 'id="sim-canvas"' in html
         assert "/static/dashboard.css" in html
         assert "/static/dashboard.js" in html
-        assert "Live Event Feed" in html
-        assert "Episode Narrator" in html
-        assert "sim-actor-panel" in html
-        assert "sim-uptime-gauge" in html
-        assert "Tasks" in html
-        assert "Admission" in html
-        assert "Lineage" in html
-        assert "Artifacts" in html
+        # Slim editorial chrome: brand bar + footer narrator + the
+        # collapsible inspector rail with Build/World/Lineage/Activity
+        # tabs. The actor panel is the rail's `actor` tab — toggled in
+        # only when an actor is clicked.
+        assert "OpenRange" in html
+        assert 'id="topbar"' in html
+        assert 'id="footbar-narrator"' in html
+        assert 'id="rail"' in html
+        assert 'data-tab="build"' in html
+        assert 'data-tab="world"' in html
+        assert 'data-tab="lineage"' in html
+        assert 'data-tab="activity"' in html
+        assert 'data-tab="actor"' in html
+        assert 'id="build-banner"' in html
+        assert 'id="toast-stack"' in html
+        # Three.js scene + light theme tokens.
         assert "THREE.WebGLRenderer" in dashboard_js
-        assert ".sim-actor-panel" in css
+        assert "--bg-0" in css
+        assert ".dash-callout" in css
+        assert ".rail-tab" in css
         assert briefing["snapshot_id"] == snapshot.id
         assert topology["snapshot_id"] == snapshot.id
         assert lineage["admission"] == snapshot.admission.as_dict()
@@ -846,6 +856,104 @@ def test_runtime_error_and_reader_paths(tmp_path: Path) -> None:
             process.kill()
             process.wait()
     assert process.poll() is not None
+
+
+def test_topology_surfaces_personas_from_manifest_when_pack_silent() -> None:
+    """Manifest NPC entries with a ``name`` populate ``green_personas``.
+
+    The cyber pack doesn't ship a ``green_personas`` list; without
+    this fallback the dashboard scene can't seat persona NPCs at
+    their desks before the first tick lands an event.
+    """
+    manifest = {
+        **MANIFEST,
+        "npc": [
+            # Plain NPC (no ``name``): no persona row.
+            {
+                "type": "cyber.browsing_user",
+                "config": {"cadence_ticks": 3, "paths": ["/"]},
+            },
+            # Persona NPC (with ``name``): one row per spawn slot.
+            {
+                "type": "cyber.office_persona",
+                "config": {
+                    "name": "Alice",
+                    "role": "engineer",
+                    "title": "Backend Engineer",
+                    "tone": "dry, precise",
+                    "colleagues": ["Bob"],
+                    "home": "svc-web",
+                },
+            },
+            {
+                "type": "cyber.office_persona",
+                "config": {
+                    "name": "Bob",
+                    "role": "it_admin",
+                    "title": "Sec Eng",
+                },
+            },
+        ],
+    }
+    snapshot = OR.build(manifest)
+    view = DashboardView(snapshot)
+    topology = view.topology()
+    personas = cast(list[dict[str, object]], topology["green_personas"])
+    by_name = {p["display_name"]: p for p in personas}
+    assert set(by_name) == {"Alice", "Bob"}
+    assert by_name["Alice"]["role"] == "engineer"
+    assert by_name["Alice"]["title"] == "Backend Engineer"
+    assert by_name["Alice"]["tone"] == "dry, precise"
+    assert by_name["Alice"]["colleagues"] == ["Bob"]
+    assert by_name["Alice"]["home"] == "svc-web"
+    assert by_name["Bob"]["role"] == "it_admin"
+    assert by_name["Bob"]["colleagues"] == []
+    assert by_name["Bob"]["home"] is None
+
+
+def test_topology_persona_count_matches_manifest_count() -> None:
+    """``count`` on a persona entry expands and disambiguates ids."""
+    manifest = {
+        **MANIFEST,
+        "npc": [
+            {
+                "type": "cyber.office_persona",
+                "count": 3,
+                "config": {"name": "Triplet", "role": "ops"},
+            },
+        ],
+    }
+    snapshot = OR.build(manifest)
+    view = DashboardView(snapshot)
+    personas = cast(
+        list[dict[str, object]],
+        view.topology()["green_personas"],
+    )
+    assert len(personas) == 3
+    ids = sorted(str(p["id"]) for p in personas)
+    assert ids == ["Triplet-1", "Triplet-2", "Triplet-3"]
+    assert all(p["role"] == "ops" for p in personas)
+
+
+def test_topology_skips_npc_entries_without_name() -> None:
+    """Plain NPC entries (no ``name``) don't pollute ``green_personas``."""
+    manifest = {
+        **MANIFEST,
+        "npc": [
+            {
+                "type": "cyber.admin_audit",
+                "config": {"audit_path": "/openapi.json"},
+            },
+            {
+                "type": "cyber.browsing_user",
+                "config": {"paths": ["/"]},
+            },
+        ],
+    }
+    snapshot = OR.build(manifest)
+    view = DashboardView(snapshot)
+    personas = view.topology()["green_personas"]
+    assert personas == []
 
 
 def test_event_bridge_replays_live_events_and_closes() -> None:

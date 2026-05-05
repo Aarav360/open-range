@@ -14,6 +14,10 @@
 
 OpenRange is a domain-agnostic environment platform for training and evaluating agents. Give it a manifest and a pack; it builds a runnable world, verifies that tasks are actually solvable in the generated environment, freezes the result as a snapshot, and hands your agent harness a stable episode to run against.
 
+<p align="center">
+  <img src="assets/openrange-demo.gif" alt="OpenRange dashboard rendering a live cyber.webapp episode — agent traffic, persona NPCs, evolve banner" width="720">
+</p>
+
 ### Why OpenRange
 
 - **Train on realistic scenarios, not static benches.** Each build samples a fresh, runnable world — new structure, new content, new exploit paths — so agents have to actually solve, not memorize.
