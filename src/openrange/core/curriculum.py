@@ -137,13 +137,19 @@ def _evolve_snapshot(
     evolved_graph = _clone_graph(snapshot.graph)
     apply_patch(evolved_graph, patch)
 
-    # Wrap the pack so admission sees the pre-evolved graph + tasks
-    # while ontology / invariants / families flow through unchanged.
-    wrapped = _PreBuiltPack(pack, evolved_graph, list(snapshot.tasks))
     manifest_in: object = snapshot.lineage.get("manifest", {})
     base_manifest: dict[str, object] = (
         dict(manifest_in) if isinstance(manifest_in, dict) else {}
     )
+
+    # Regenerate tasks from the evolved graph — a mutation that changes a
+    # task's shape (e.g. build's difficulty level) has to reach the agent's
+    # instruction, not just the graph.
+    regenerated: list[TaskSpec] = []
+    for family in pack.task_families():
+        regenerated.extend(family.generate(evolved_graph, base_manifest, None))
+
+    wrapped = _PreBuiltPack(pack, evolved_graph, regenerated)
     evolved_manifest = {
         **base_manifest,
         "_evolve": {
