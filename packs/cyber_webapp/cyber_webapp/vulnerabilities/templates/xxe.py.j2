@@ -1,0 +1,85 @@
+"""XML handler — parsed by a real SAX parser with external entities enabled."""
+
+
+def handle(query, state):
+    document = (query.get({{ target_param | tojson }}, [""]) or [""])[0]
+    files = state.get("files", {})
+
+    # The flag is exfiltrated by a SYSTEM external general entity expanded by the
+    # parser, but the document shape that triggers a leak differs per context; a
+    # document built for the wrong context yields nothing:
+    #   element_content -> the entity is reflected from element text under any
+    #                      root: ``<!DOCTYPE x [<!ENTITY e SYSTEM
+    #                      "file://PATH">]><x>&e;</x>``.
+    #   wrapped_root    -> only text inside a specific root element is reflected,
+    #                      so the entity must be wrapped in ``<ROOT>&e;</ROOT>``;
+    #                      any other root reflects nothing.
+    #   scheme_prefix   -> the resolver only honors a SYSTEM id carrying a
+    #                      specific URI scheme, so the SYSTEM literal needs that
+    #                      wrapper (``SCHEME + PATH``) instead of ``file://``; a
+    #                      ``file://`` id resolves to empty. (Mirrors real XXE
+    #                      wrapper-matching, e.g. ``php://filter/...resource=``.)
+    context = {{ (entity_context | default("element_content")) | tojson }}
+    root_element = {{ (root_element | default("data")) | tojson }}
+    uri_scheme = {{ (uri_scheme | default("file://")) | tojson }}
+
+    # External general entities are enabled and a SYSTEM entity is resolved
+    # against the file store, so a well-formed DOCTYPE/ENTITY/reference expands
+    # the file into the response.
+    class _Resolver(xml.sax.handler.EntityResolver):
+        def resolveEntity(self, public_id, system_id):
+            # element_content/wrapped_root accept the classic ``file://``; the
+            # scheme_prefix context demands the build's own scheme wrapper, so a
+            # mismatched scheme falls through to an empty source (no leak).
+            scheme = uri_scheme if context == "scheme_prefix" else "file://"
+            if scheme not in system_id:
+                empty = xml.sax.xmlreader.InputSource()
+                empty.setCharacterStream(io.StringIO(""))
+                return empty
+            path = system_id.split(scheme, 1)[-1]
+            source = xml.sax.xmlreader.InputSource()
+            source.setCharacterStream(io.StringIO(files.get(path, "")))
+            return source
+
+    captured = []
+
+    class _Capture(xml.sax.handler.ContentHandler):
+        def __init__(self):
+            # Each context reflects at a disjoint position:
+            #   scheme_prefix   -> reflect anywhere (its gate is the URI scheme).
+            #   element_content -> reflect only the document root's direct text
+            #                      (depth 1), so a nested entity is ignored.
+            #   wrapped_root    -> reflect only inside the sampled child element,
+            #                      where the entity is nested (depth >= 2), which
+            #                      element_content's depth-1 check rejects.
+            self._depth = 0
+            self._reflecting = context == "scheme_prefix"
+
+        def startElement(self, name, attrs):
+            self._depth += 1
+            if context == "wrapped_root" and name == root_element:
+                self._reflecting = True
+            elif context == "element_content":
+                self._reflecting = self._depth == 1
+
+        def endElement(self, name):
+            if context == "wrapped_root" and name == root_element:
+                self._reflecting = False
+            self._depth -= 1
+            if context == "element_content":
+                self._reflecting = self._depth == 1
+
+        def characters(self, content):
+            if self._reflecting:
+                captured.append(content)
+
+    try:
+        parser = xml.sax.make_parser()
+        parser.setFeature(xml.sax.handler.feature_external_ges, True)
+        parser.setContentHandler(_Capture())
+        parser.setEntityResolver(_Resolver())
+        parser.parse(io.StringIO(document))
+        body = "".join(captured)
+    except Exception as exc:
+        body = "parse error: " + type(exc).__name__
+    return 200, {"Content-Type": "application/xml"}, body.encode()

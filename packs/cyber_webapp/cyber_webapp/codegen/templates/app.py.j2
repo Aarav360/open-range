@@ -9,10 +9,16 @@ requests.
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
+import posixpath
 import re
+import shlex
 import sqlite3
+import xml.sax
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from jinja2.sandbox import SandboxedEnvironment
 from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
@@ -45,6 +51,7 @@ def _load_seed_and_init_state(seed_path: Path) -> dict:
         "db": db,
         "secrets": payload["secrets"],
         "accounts": payload["accounts"],
+        "files": payload.get("files", {}),
         "schema": schema,
     }
 
@@ -60,7 +67,6 @@ _DISCOVERY = {{ discovery | tojson }}
 
 
 def _index(query, state):
-    """Public landing page — always available so probes have a route."""
     del query, state
     return 200, {"Content-Type": "text/html"}, _index_html()
 
@@ -75,7 +81,6 @@ def _index_html() -> bytes:
 
 
 def _openapi(query, state):
-    """Public OpenAPI-ish discovery endpoint."""
     del query, state
     return (
         200,

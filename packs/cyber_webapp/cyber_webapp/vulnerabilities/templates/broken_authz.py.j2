@@ -1,11 +1,51 @@
-"""Role-gated handler — checks a request-supplied header for the role assertion."""
+"""Role-gated handler — trusts a client-supplied value as the role assertion.
+
+The runtime only passes the parsed query string to ``handle`` (request headers
+are never read), so the trusted value is a QUERY PARAMETER with a header-styled
+name (e.g. ``X-User-Role``): a client-controlled value trusted with no real
+provenance check.
+"""
 import json
 
 
 def handle(query, state):
-    header_values = query.get({{ trust_header | tojson }}, [""])
-    role = header_values[0] if header_values else ""
-    if role != {{ expected_value | tojson }}:
+    # The three contexts are mutually exclusive: each grants on a different
+    # request shape and rejects the others'.
+    #   single_token  -> role param equals expected AND no confirm param present.
+    #   dual_factor   -> role param equals expected AND confirm param equals its
+    #                    on-value.
+    #   encoded_token -> role param carries expected HEX-encoded AND no confirm
+    #                    param present.
+    trust_context = {{ (trust_context | default("single_token")) | tojson }}
+    confirm_param = {{ (confirm_param | default("X-Confirm")) | tojson }}
+    confirm_value = {{ (confirm_value | default("1")) | tojson }}
+    # single_token and encoded_token reject a request carrying ANY of these
+    # params, not just this build's own ``confirm_param``.
+    confirm_pool = {{ (confirm_pool | default(["X-Confirm", "X-Internal", "X-Verified", "X-Elevated"])) | tojson }}
+
+    def _param(name):
+        values = query.get(name, [""])
+        return values[0] if values else ""
+
+    role = _param({{ trust_header | tojson }})
+    expected = {{ expected_value | tojson }}
+    # Presence, not value, of any confirm param distinguishes a dual_factor
+    # request from a single/encoded one.
+    confirm_present = any(name in query for name in confirm_pool)
+
+    if trust_context == "encoded_token":
+        # Compares against the hex encoding of the expected role, so the wire
+        # value is the encoding, not the plain string.
+        authorized = role == expected.encode().hex() and not confirm_present
+    elif trust_context == "dual_factor":
+        # A second client-controlled gate must also be toggled on; both are
+        # trusted with no real check.
+        gate = _param(confirm_param)
+        authorized = role == expected and gate == confirm_value
+    else:  # single_token
+        authorized = role == expected and not confirm_present
+
+    if not authorized:
         return 403, {}, b"forbidden"
     secret = state.get("secrets", {}).get({{ leak_field | tojson }}, "")
     return (

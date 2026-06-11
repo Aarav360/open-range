@@ -1,10 +1,14 @@
-"""URL-fetching handler — validates destination after the fetch completes."""
-import json
-import re
-from urllib.error import URLError
-from urllib.request import urlopen
+"""URL-fetching handler — a client parameter is used as a server-side fetch
+target, and an internal resource that the filter is meant to protect leaks the
+secret when the supplied URL reaches it.
 
-_ALLOWLIST = re.compile({{ allowlist_pattern | tojson }})
+The fetch is kept in-process so it is deterministic: instead of opening a socket
+to the supplied host, the handler recognizes when the URL resolves to the
+designated INTERNAL host and returns ``state["secrets"]["flag"]`` — modeling an
+SSRF that reaches an internal metadata/admin endpoint exposing the secret.
+"""
+import json
+from urllib.parse import urlparse
 
 
 def handle(query, state):
@@ -12,12 +16,89 @@ def handle(query, state):
     target = values[0] if values else ""
     if not target:
         return 400, {}, b"missing url"
-    try:
-        with urlopen(target, timeout=2) as response:  # noqa: S310
-            body = response.read()
-            final_url = response.geturl()
-    except URLError as exc:
-        return 502, {}, str(exc).encode()
-    if not _ALLOWLIST.match(final_url):
-        return 403, {}, b"allowlist violation"
-    return 200, {"Content-Type": "application/octet-stream"}, body or b""
+
+    internal_host = {{ (internal_host | default("169.254.169.254")) | tojson }}
+    allowed_host = {{ (allowed_host | default("allowed.example.com")) | tojson }}
+    # The three filters are DISJOINT: each admits exactly ONE evasion and
+    # actively rejects the other two, while all three still reach the SAME
+    # internal resource.
+    #   scheme_block   -> http/https are rejected outright, so ONLY a non-web
+    #                     scheme (gopher://<internal_host>/...) reaches it; the
+    #                     allowlist ``@``-trick and the decimal-IP URL are http
+    #                     and get rejected here.
+    #   host_allowlist -> a naive "raw URL must contain the allowed-host
+    #                     substring" gate, AND the scheme must be http(s): ONLY a
+    #                     credential/fragment trick that carries the allowed host
+    #                     yet RESOLVES to the internal host works
+    #                     (http://<allowed_host>@<internal_host>/). A plain
+    #                     http://<internal_host>/ lacks the substring (rejected);
+    #                     a gopher URL has the wrong scheme (rejected); a
+    #                     decimal-IP URL lacks the substring (rejected).
+    #   decimal_ip     -> the destination host must be the DECIMAL integer form of
+    #                     the internal IPv4 (e.g. 169.254.169.254 -> 2852039166,
+    #                     http://2852039166/). The dotted-quad / hostname form is
+    #                     rejected, so the gopher and ``@``-trick payloads (which
+    #                     use the dotted/hostname internal_host) do NOT match.
+    ssrf_filter = {{ (ssrf_filter | default("decimal_ip")) | tojson }}
+
+    parsed = urlparse(target)
+    scheme = (parsed.scheme or "").lower()
+    # ``hostname`` is the real fetch destination: it strips any ``user@`` and
+    # ``:port``, and ignores the ``#fragment`` — exactly what a URL library
+    # hands to the socket layer, which is why naive string filters are bypassable.
+    host = (parsed.hostname or "").lower()
+
+    # Decimal (integer) form of the internal IPv4, computed by hand to avoid a
+    # ``socket``/``ipaddress`` import. Empty string when ``internal_host`` is not
+    # a dotted-quad, in which case the decimal_ip filter can never match.
+    def _ipv4_to_decimal(h):
+        parts = h.split(".")
+        if len(parts) != 4:
+            return ""
+        acc = 0
+        for part in parts:
+            if not part.isdigit():
+                return ""
+            octet = int(part)
+            if octet > 255:
+                return ""
+            acc = acc * 256 + octet
+        return str(acc)
+
+    internal_decimal = _ipv4_to_decimal(internal_host.lower())
+
+    if ssrf_filter == "scheme_block":
+        # Only a non-web scheme survives; http(s) is blocked and every other
+        # scheme is unsupported. The other two evasions are http -> rejected.
+        if scheme in ("http", "https"):
+            return 403, {}, b"scheme not allowed"
+        if scheme != "gopher":
+            return 502, {}, b"unsupported scheme"
+        reached = host == internal_host.lower()
+    elif ssrf_filter == "host_allowlist":
+        # Web-only substring allowlist on the RAW url. Non-web schemes are
+        # refused (kills the gopher payload); the raw url must literally contain
+        # the allowed host (kills the plain internal-host and decimal-IP URLs);
+        # the ONLY pass is the credential/fragment trick that resolves internal.
+        if scheme not in ("http", "https"):
+            return 502, {}, b"unsupported scheme"
+        if allowed_host not in target:
+            return 403, {}, b"allowlist violation"
+        reached = host == internal_host.lower()
+    else:  # decimal_ip
+        # The destination must be the bare decimal integer form of the internal
+        # IPv4. Non-web schemes are refused (kills gopher); the dotted-quad /
+        # hostname host is refused (kills the ``@``-trick and plain URLs); only
+        # ``http://<decimal>/`` matches.
+        if scheme not in ("http", "https"):
+            return 502, {}, b"unsupported scheme"
+        reached = bool(internal_decimal) and host == internal_decimal
+
+    if reached:
+        secret = state.get("secrets", {}).get("flag", "")
+        body = json.dumps({"data": secret}).encode()
+        return 200, {"Content-Type": "application/json"}, body
+
+    # A URL that passed the filter but points elsewhere fetches "nothing
+    # interesting" — no secret, just a benign stub response.
+    return 200, {"Content-Type": "application/json"}, b'{"data": ""}'

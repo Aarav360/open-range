@@ -1,0 +1,48 @@
+"""File-serving handler — requested path is joined onto a base without confinement."""
+import posixpath
+
+
+def handle(query, state):
+    requested = (query.get({{ target_param | tojson }}, [""]) or [""])[0]
+    base_dir = {{ base_dir | tojson }}
+    original = requested  # raw input, used below to classify a failed attempt
+    # Each confinement context accepts exactly ONE traversal technique and rejects
+    # the other two, so a payload that escapes under one 404s under the others.
+    #   absolute_only -> recursive "../" strip annihilates any relative chain
+    #                    (plain "../" or "....//"); only an absolute arg, which
+    #                    posixpath.join honors by discarding base, escapes.
+    #   relative      -> an absolute arg is re-anchored under base_dir; no strip
+    #                    runs, so only a plain relative "../" chain climbs out.
+    #   dotdot_filter -> strips "../" once and re-anchors absolutes; only "....//",
+    #                    which collapses back to "../" after the single strip,
+    #                    survives.
+    confinement = {{ (confinement | default("absolute_only")) | tojson }}
+
+    if confinement == "absolute_only":
+        # Recursive strip annihilates both a plain "../" chain and a "....//" one.
+        while "../" in requested:
+            requested = requested.replace("../", "")
+    elif confinement == "dotdot_filter":
+        # Single strip: a plain "../" chain is removed, but "....//" collapses
+        # back to "../" and survives.
+        requested = requested.replace("../", "")
+
+    # An absolute arg discards base_dir, and a surviving "../" climbs out of it.
+    resolved = posixpath.normpath(posixpath.join(base_dir, requested))
+
+    if confinement in ("relative", "dotdot_filter"):
+        # Re-anchoring only blocks absolute escapes: a surviving "../" chain is
+        # not collapsed first, so the relative escape still works here.
+        if posixpath.isabs(requested):
+            requested = requested.lstrip("/")
+            resolved = posixpath.normpath(posixpath.join(base_dir, requested))
+
+    files = state.get("files", {})
+    if resolved in files:
+        body = str(files[resolved]).encode()
+        return 200, {"Content-Type": "text/plain"}, body
+    # A traversal-shaped attempt that this context neutralized gets a distinct
+    # 403; a benign filename miss stays 404. Neither leaks the flag.
+    if ".." in original or original.startswith("/"):
+        return 403, {"Content-Type": "application/json"}, b'{"error": "path not permitted"}'
+    return 404, {"Content-Type": "application/json"}, b'{"error": "file not found"}'

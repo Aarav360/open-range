@@ -11,7 +11,6 @@ Four concerns:
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -32,25 +31,44 @@ from graphschema import Node, Visibility
 
 
 def _exec_handler(source: str) -> Any:
-    """Compile rendered source and return the ``handle`` function."""
     namespace: dict[str, Any] = {}
     exec(compile(source, "<rendered>", "exec"), namespace)
     return namespace["handle"]
 
 
 def test_catalog_has_starter_vulns() -> None:
-    assert set(CATALOG) == {"sql_injection", "ssrf", "broken_authz"}
+    assert set(CATALOG) == {
+        "sql_injection",
+        "ssrf",
+        "broken_authz",
+        "path_traversal",
+        "command_injection",
+        "xxe",
+        "ssti",
+        "idor",
+        "weak_credentials",
+    }
     assert vuln("sql_injection") is SQL_INJECTION
 
 
 def test_vulns_for_kind_filters_by_target() -> None:
     endpoint_vulns = vulns_for_kind("endpoint")
-    assert {v.id for v in endpoint_vulns} == {"sql_injection", "ssrf", "broken_authz"}
+    assert {v.id for v in endpoint_vulns} == {
+        "sql_injection",
+        "ssrf",
+        "broken_authz",
+        "path_traversal",
+        "command_injection",
+        "xxe",
+        "ssti",
+        "idor",
+        "weak_credentials",
+    }
     assert vulns_for_kind("network") == ()
 
 
 def test_chain_metadata() -> None:
-    """SSRF enables broken_authz (per Marinade-style chain modeling)."""
+    """SSRF enables broken_authz; SQL injection enables a data-store dump."""
     assert "broken_authz" in SSRF.enables
     assert "data_store_dump" in SQL_INJECTION.enables
 
@@ -84,7 +102,6 @@ def test_merge_catalog_overrides() -> None:
     )
     merged = merge_catalog(CATALOG, {custom.id: custom})
     assert merged["sql_injection"].family == "custom"
-    # Other entries preserved.
     assert merged["ssrf"] is SSRF
 
 
@@ -95,7 +112,6 @@ def test_sql_injection_template_renders() -> None:
     )
     assert "def handle(query, state):" in src
     assert "execute(sql)" in src
-    # Compiles.
     compile(src, "<test>", "exec")
 
 
@@ -156,7 +172,10 @@ def test_sql_injection_actually_exfiltrates() -> None:
         ("admin", "EXFIL_TOKEN_42"),
     )
     db.commit()
-    state = {"db": db}
+    state = {
+        "db": db,
+        "schema": {"table": "rows", "key_column": "key", "value_column": "secret_col"},
+    }
 
     # Benign request: returns the public row.
     status, _, body = handle({"q": ["public"]}, state)
@@ -170,31 +189,29 @@ def test_sql_injection_actually_exfiltrates() -> None:
     assert b"EXFIL_TOKEN_42" in body, body
 
 
-def test_ssrf_actually_fetches_internal(tmp_path: Path) -> None:
-    """SSRF should fetch a file:// URL even though allowlist intends http only."""
-    secret_file = tmp_path / "internal_secret.txt"
-    secret_file.write_text("ORANGE{ssrf_leaked}", encoding="utf-8")
-
+def test_ssrf_reaches_internal_host_and_leaks() -> None:
+    """SSRF that resolves to the internal host exposes the protected secret."""
     src = render_vulnerability(
         SSRF,
-        {"target_param": "url", "allowlist_pattern": r"^http://internal\."},
+        {
+            "target_param": "url",
+            "internal_host": "169.254.169.254",
+            "allowed_host": "ok.example.com",
+            "ssrf_filter": "decimal_ip",
+        },
     )
     handle = _exec_handler(src)
+    state = {"secrets": {"flag": "ORANGE{ssrf_leaked}"}}
 
-    # The agent supplies a file:// URL. The bug: fetch fires before
-    # allowlist check. By the time the post-hoc check runs, the body
-    # is already in our hands — but the handler returns 403 because
-    # the URL doesn't match. Test: even the 403 path doesn't *prevent*
-    # the side effect (here we test that the fetch reaches the file).
-    status, _, body = handle({"url": [f"file://{secret_file}"]}, {})
-    # Allowlist rejects → 403, but in a real exploit the agent would use
-    # an http URL; we verify the fetch path with file://.
-    assert status == 403  # allowlist post-hoc denies file:// URL
-    # The "real" exploitability is verified by ssrf to localhost:
-    # we don't spin a server here; the SQLi + authz tests cover the
-    # functional bug-fires-end-to-end pattern. The point of THIS test
-    # is that the fetch happens (we got a non-network 403, not a
-    # "missing url" 400).
+    # The decimal-integer form of the internal IP resolves to it and leaks.
+    status, _, body = handle({"url": ["http://2852039166/"]}, state)
+    assert status == 200
+    assert b"ORANGE{ssrf_leaked}" in body
+
+    # The dotted-quad form is rejected by the decimal_ip filter — no leak.
+    status, _, body = handle({"url": ["http://169.254.169.254/"]}, state)
+    assert status == 200
+    assert b"ORANGE{ssrf_leaked}" not in body
 
 
 def test_ssrf_post_hoc_allowlist_lets_through_matching_url() -> None:
@@ -264,12 +281,9 @@ def test_catalog_entry_drives_hidden_vulnerability_node() -> None:
 
 
 def test_every_catalog_entry_targets_a_real_ontology_kind() -> None:
-    """Every catalog entry's ``target_kinds`` are kinds the new ontology declares.
-
-    The ``affects`` edge in the new ontology accepts
-    ``(vulnerability, endpoint)`` and ``(vulnerability, service)``; the
-    catalog must restrict ``target_kinds`` to that domain or the
-    sampler would emit an edge the conformance check would reject.
+    """The ``affects`` edge only accepts ``(vulnerability, endpoint)`` and
+    ``(vulnerability, service)``, so ``target_kinds`` must stay within that
+    domain or the sampler emits an edge that fails conformance.
     """
     allowed = {"endpoint", "service"}
     for vid, v in CATALOG.items():

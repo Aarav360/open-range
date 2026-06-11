@@ -1,0 +1,49 @@
+"""Template handler — the parameter is rendered by the real template engine."""
+
+
+def handle(query, state):
+    expr = (query.get({{ target_param | tojson }}, [""]) or [""])[0]
+    {% raw %}# Untrusted input is rendered as a Jinja template with the app's config
+    # in scope, so an injected expression is evaluated by the real engine
+    # ({{ 7*7 }} -> 49) and can dump the config that holds the data. Sandboxed
+    # here, so no Python-object escape; a container backing would run it
+    # unsandboxed for full RCE.
+    #
+    # The render sink varies per build, and the three sinks are disjoint: each
+    # needs a break-out that is inert (or a syntax error) in the other two,
+    # because the input lands in a different template position and the working
+    # technique differs:
+    #   - attribute: input is spliced as the value of a quoted data field,
+    #                ``{"v": "<input>"}``, then the whole string is rendered.
+    #                The field value is template DATA, so a print TAG fires in
+    #                place: ``{{ config[...] }}`` is substituted into the value.
+    #                Comment-close and bare-expression break-outs do nothing
+    #                here -- ``#} ... {#`` is literal text and a bare expression
+    #                is echoed verbatim.
+    #   - comment:   input is wrapped inside a Jinja comment ``{# ... #}``, which
+    #                the engine discards -- a naive print ``{{ ... }}`` produces
+    #                no output, so the comment must be CLOSED (``#} ... {#``) to
+    #                reach print context. A bare expression stays swallowed.
+    #   - expr:      input is spliced INTO an existing print expression around a
+    #                string literal, so it is already between ``{{`` and ``}}``;
+    #                a nested print ``{{`` is a syntax error (attribute payload
+    #                fails) and ``#}``/``{#`` are a syntax error too (comment
+    #                payload fails). Only a bare EXPRESSION joined to the
+    #                surrounding template via the ``~`` operator works.{% endraw %}
+    config = state.get("files", {})
+    sink = {{ (render_sink | default("attribute")) | tojson }}
+    {% raw %}if sink == "comment":
+        source = "{# " + expr + " #}"
+    elif sink == "expr":
+        source = "{{ '[' ~ " + expr + " ~ ']' }}"
+    else:  # attribute: input is the value of a quoted data field
+        source = '{"v": "' + expr + '"}'{% endraw %}
+    try:
+        rendered = SandboxedEnvironment().from_string(source).render(config=config)
+    except Exception as exc:
+        rendered = "render error: " + type(exc).__name__
+    # Distinguish an injection this sink swallowed (empty render, but the input
+    # carried template syntax) from a benign string that rendered to itself.
+    if not rendered and {% raw %}any(t in expr for t in ("{{", "}}", "{#", "#}")){% endraw %}:
+        rendered = "template directive ignored"
+    return 200, {"Content-Type": "text/plain"}, rendered.encode()

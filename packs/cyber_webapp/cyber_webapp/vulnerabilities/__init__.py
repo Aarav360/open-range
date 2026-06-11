@@ -20,6 +20,9 @@ class Vulnerability:
     description: str
     target_kinds: frozenset[str]
     template: str
+    # How the exploit reaches the flag; the loot stage picks a vuln whose
+    # shape matches the placed loot.
+    shape: str = "response_leak"
     requires: frozenset[str] = frozenset()
     enables: frozenset[str] = frozenset()
     attrs_schema: Mapping[str, str] = field(default_factory=dict)
@@ -31,6 +34,7 @@ class Vulnerability:
             "description": self.description,
             "target_kinds": sorted(self.target_kinds),
             "template": self.template,
+            "shape": self.shape,
             "requires": sorted(self.requires),
             "enables": sorted(self.enables),
             "attrs_schema": dict(self.attrs_schema),
@@ -56,6 +60,7 @@ class Vulnerability:
             description=str(data.get("description", "")),
             target_kinds=frozenset(str(k) for k in target_kinds_raw),
             template=str(data["template"]),
+            shape=str(data.get("shape", "response_leak")),
             requires=frozenset(str(k) for k in requires_raw),
             enables=frozenset(str(k) for k in enables_raw),
             attrs_schema={str(k): str(v) for k, v in attrs_raw.items()},
@@ -71,6 +76,7 @@ SQL_INJECTION = Vulnerability(
     ),
     target_kinds=frozenset({"endpoint"}),
     template="sql_injection.py.j2",
+    shape="response_leak",
     enables=frozenset({"data_store_dump"}),
     attrs_schema={
         "target_param": "name of the query parameter that flows into SQL",
@@ -88,6 +94,7 @@ SSRF = Vulnerability(
     ),
     target_kinds=frozenset({"endpoint"}),
     template="ssrf.py.j2",
+    shape="response_leak",
     enables=frozenset({"broken_authz", "metadata_credential_leak"}),
     attrs_schema={
         "target_param": "name of the query parameter holding the URL",
@@ -105,7 +112,8 @@ BROKEN_AUTHZ = Vulnerability(
     ),
     target_kinds=frozenset({"endpoint"}),
     template="broken_authz.py.j2",
-    requires=frozenset(),  # primary; chains often start here or via SSRF
+    shape="response_leak",
+    requires=frozenset(),
     attrs_schema={
         "trust_header": "HTTP header name the endpoint trusts (e.g. X-User-Role)",
         "expected_value": "value that grants admin access (e.g. 'admin')",
@@ -114,10 +122,121 @@ BROKEN_AUTHZ = Vulnerability(
 )
 
 
+PATH_TRAVERSAL = Vulnerability(
+    id="path_traversal",
+    family="code_web",
+    description=(
+        "Endpoint serves a file named by a client parameter, joining it onto "
+        "a base directory without confining the result — '../' or an absolute "
+        "path escapes to read any file in the store, including the flag."
+    ),
+    target_kinds=frozenset({"endpoint"}),
+    template="path_traversal.py.j2",
+    shape="file_read",
+    attrs_schema={
+        "target_param": "query parameter holding the requested file path",
+        "base_dir": "directory the path is joined onto (the unenforced confinement)",
+    },
+)
+
+
+COMMAND_INJECTION = Vulnerability(
+    id="command_injection",
+    family="code_web",
+    description=(
+        "Diagnostic endpoint concatenates a client parameter into a shell "
+        "command without sanitizing it — shell metacharacters (';', '|') "
+        "inject an extra command that reads the flag file."
+    ),
+    target_kinds=frozenset({"endpoint"}),
+    template="command_injection.py.j2",
+    shape="code_exec",
+    attrs_schema={
+        "target_param": "query parameter concatenated into the command",
+        "base_command": "the diagnostic command the input is appended to",
+    },
+)
+
+
+XXE = Vulnerability(
+    id="xxe",
+    family="code_web",
+    description=(
+        "Endpoint parses client XML with external entities enabled, so a "
+        "SYSTEM entity referencing a file path is resolved and reflected — "
+        "reading any file in the store, including the flag."
+    ),
+    target_kinds=frozenset({"endpoint"}),
+    template="xxe.py.j2",
+    shape="file_read",
+    attrs_schema={
+        "target_param": "query parameter holding the XML document",
+    },
+)
+
+
+SSTI = Vulnerability(
+    id="ssti",
+    family="code_web",
+    description=(
+        "Endpoint renders a client parameter as a template, so a template "
+        "expression like '{{ read(\"/path\") }}' is evaluated and reads the "
+        "flag file from the store."
+    ),
+    target_kinds=frozenset({"endpoint"}),
+    template="ssti.py.j2",
+    shape="code_exec",
+    attrs_schema={
+        "target_param": "query parameter rendered as a template",
+    },
+)
+
+
+IDOR = Vulnerability(
+    id="idor",
+    family="code_web",
+    description=(
+        "Endpoint returns a record by a client-supplied id with no ownership "
+        "or authorization check — referencing the flag record's id leaks it."
+    ),
+    target_kinds=frozenset({"endpoint"}),
+    template="idor.py.j2",
+    shape="response_leak",
+    attrs_schema={
+        "target_param": "query parameter holding the object id",
+    },
+)
+
+
+WEAK_CREDENTIALS = Vulnerability(
+    id="weak_credentials",
+    family="code_web",
+    description=(
+        "Authentication endpoint accepts a default/weak credential pair, so "
+        "guessing it (e.g. admin/admin) returns the protected secret."
+    ),
+    target_kinds=frozenset({"endpoint"}),
+    template="weak_credentials.py.j2",
+    shape="response_leak",
+    attrs_schema={
+        "user_param": "query parameter holding the username",
+        "password_param": "query parameter holding the password",
+        "weak_user": "the accepted default username",
+        "weak_password": "the accepted default password",
+    },
+)
+
+
 CATALOG: Mapping[str, Vulnerability] = {
     SQL_INJECTION.id: SQL_INJECTION,
     SSRF.id: SSRF,
     BROKEN_AUTHZ.id: BROKEN_AUTHZ,
+    PATH_TRAVERSAL.id: PATH_TRAVERSAL,
+    COMMAND_INJECTION.id: COMMAND_INJECTION,
+    XXE.id: XXE,
+    SSTI.id: SSTI,
+    IDOR.id: IDOR,
+    WEAK_CREDENTIALS.id: WEAK_CREDENTIALS,
 }
 
 
@@ -132,12 +251,8 @@ def vulns_for_kind(kind: str) -> tuple[Vulnerability, ...]:
 
 
 def _jinja_env() -> Environment:
-    """Build a Jinja2 environment scoped to the bundled templates dir.
-
-    ``StrictUndefined`` raises on missing variables — callers must supply
-    every parameter the template references. Autoescape is disabled because
-    we're rendering Python source, not HTML.
-    """
+    # StrictUndefined makes a missing template parameter fail fast; autoescape
+    # is off because the output is Python source, not HTML.
     return Environment(
         loader=FileSystemLoader(str(VULN_TEMPLATES_DIR)),
         undefined=StrictUndefined,
@@ -193,8 +308,14 @@ def merge_catalog(
 __all__ = [
     "BROKEN_AUTHZ",
     "CATALOG",
+    "COMMAND_INJECTION",
+    "IDOR",
+    "PATH_TRAVERSAL",
     "SQL_INJECTION",
     "SSRF",
+    "SSTI",
+    "WEAK_CREDENTIALS",
+    "XXE",
     "VULN_TEMPLATES_DIR",
     "Vulnerability",
     "catalog_from_yaml",
