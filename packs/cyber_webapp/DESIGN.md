@@ -543,13 +543,13 @@ number — which is the independent verifier's job.
 
 ---
 
-## 9. Emergent mode at scale: the realization ladder
+## 9. Scaling up: LLM-realized services on the procedural graph
 
 §8 built the *verifier*. This is what it unlocks: stop templating worlds and let an
 LLM **realize** them — keeping procedural as the architect and the verifier as the
-gate, at rising fidelity.
+gate, at rising realism.
 
-The invariant at every rung: **procedural architects the graph** (topology, flag
+The invariant at every stage: **procedural architects the graph** (topology, flag
 placement, the solvability skeleton — the controllable, scalable, solvable-by-
 construction part that is OpenRange's differentiator); **the LLM realizes each node**
 into a real, varied service; **admission verifies** (the consequence oracle + the
@@ -562,21 +562,61 @@ low controllability, and — §8.10 measured this — mostly *broken* ones. The 
 engine is the controllable variation source; the LLM is realism *per node, behind
 admission*. The LLM never architects correctness.
 
-The ladder (each rung an existing issue except M0):
+Each stage adds realism over the last; each is tracked by its own issue:
 
-| rung | the LLM realizes | runtime | issue |
-| --- | --- | --- | --- |
-| **M0** | a vuln *handler* — varied implementations within a class, dynamically admission-gated by run-the-exploit | `PROCESS` (today) | *new* |
-| **M1** | a node as a real **container** image — real fs/shell ⇒ real RCE/file-read | `Backing.CONTAINER` | [#252](https://github.com/vecna-labs/open-range/issues/252) |
-| **M2** | **multiple** networked services; graph edges become real links — SSRF→internal, pivot, credential reuse | containers + net | [#212](https://github.com/vecna-labs/open-range/issues/212), [#235](https://github.com/vecna-labs/open-range/issues/235) |
-| **M3** | a **k8s** topology — pods/services/network-policies/RBAC; lateral movement + k8s-native classes (RBAC escalation, SA-token theft, netpol bypass, pod escape) | Kind | [#189](https://github.com/vecna-labs/open-range/issues/189) |
+| the LLM realizes | runtime | tracked in |
+| --- | --- | --- |
+| a vuln *handler* — varied implementations within a class, admission-gated by running the exploit | `PROCESS` (today) | [#260](https://github.com/vecna-labs/open-range/issues/260) |
+| a node as a real **container** — real fs/shell, so file-read / RCE actually execute | `Backing.CONTAINER` | [#252](https://github.com/vecna-labs/open-range/issues/252) (hardening: [#265](https://github.com/vecna-labs/open-range/issues/265)) |
+| **multiple** networked services; graph edges become real links — SSRF→internal, pivot, credential reuse | containers + net | [#212](https://github.com/vecna-labs/open-range/issues/212), [#235](https://github.com/vecna-labs/open-range/issues/235) |
+| a **k8s** topology — pods/services/network-policies/RBAC; lateral movement + k8s-native classes (RBAC escalation, SA-token theft, netpol bypass, pod escape) | Kind | [#189](https://github.com/vecna-labs/open-range/issues/189) |
 
-M0 is the realization *primitive* every rung is built from: the **dynamic admission
-gate** — render the LLM's realization, run the intended exploit, confirm the flag
-leaks via `consequence.detect_leak`, confirm a benign request does *not* — is what
-makes letting an LLM write the world safe. (Today's admission is *structural* — a
-graph-path check; an LLM realization needs *dynamic* admission, because the code
-might be wrong.) Exec-effect faithfulness rides the container
-([#202](https://github.com/vecna-labs/open-range/issues/202) sandbox). This is also
-the sim-to-real fidelity ladder (`PROCESS` → `CONTAINER` → cluster) the H2 study
-measures on.
+The first stage ([#260](https://github.com/vecna-labs/open-range/issues/260)) is the
+realization *primitive* every later one builds on: the **dynamic admission gate** —
+render the LLM's realization, run the intended exploit, confirm the flag leaks via
+`consequence.detect_leak`, confirm a benign request does *not* — is what makes letting
+an LLM write the world safe. (Today's admission is *structural* — a graph-path check;
+an LLM realization needs *dynamic* admission, because the code might be wrong.)
+Exec-effect faithfulness rides the container sandbox
+([#202](https://github.com/vecna-labs/open-range/issues/202)). This is also the
+sim-to-real progression (`PROCESS` → `CONTAINER` → cluster) the study measures on.
+
+**Container backing — status.** It runs the *one* generated multi-service app (not a
+bespoke app per class). The container sets `OPENRANGE_REALFS`, which flips the rendered
+app's surfaces from in-memory emulation to the real container; `PROCESS` leaves it unset
+and stays byte-for-byte the emulation. **file_read** (path_traversal, xxe) becomes real
+with zero handler changes — the `files` surface is a real filesystem (`_RealFiles`, a real
+`open()` per path), so a traversal escape is real OS path resolution. **code_exec**
+command_injection runs a real `sh -c` (the §6 mutually-exclusive contexts preserved by the
+same naive per-context filter, now over a real shell). Both are proven live by docker-gated,
+context-parametrized tests. The world container — which now runs real RCE — is contained
+with dropped capabilities + no-new-privileges + memory/cpu/pid caps (`hardening_run_args`,
+verified live: `CapEff` all-zero inside, still exploitable under the flags).
+
+This is wired as a real runtime: `ContainerWebappRuntime` runs the world as a container
+that episodes actually use, selected by `Backing.CONTAINER`. It reuses the subprocess
+runtime (`docker run` is the supervised child), resolves the published host port with
+`docker port`, and reads the leak signal out of the running container. The load-bearing
+check is **cross-backing parity**: the same snapshot + same exploit grades *identically*
+on `PROCESS` and `CONTAINER` — only fidelity changes, not the task surface. Scope: one
+container for the whole world; many per-service containers on a real network is the
+networked-services work ([#212](https://github.com/vecna-labs/open-range/issues/212) /
+[#235](https://github.com/vecna-labs/open-range/issues/235)).
+
+The rest is tracked in [#265](https://github.com/vecna-labs/open-range/issues/265):
+read-only-rootfs, egress policy, flag-out-of-image, and ssti real (unsandboxed eval).
+
+**Two environments, not one (the world vs. the agent).** A generated world is the
+*target* the agent attacks, reached only over its HTTP surface (`base_url`); the agent
+never runs inside it. So the world image carries only what its OWN behavior needs: when a
+vuln runs a real OS command server-side — command_injection shelling out to a diagnostic
+tool like `ping`/`nslookup` — that tool is installed in the target container *because the
+server runs it*, and only in worlds that actually have that vuln (`required_apt_packages`
+in `container.py`; a file-read-only world installs nothing). A world is not a toolbox: we
+do not preinstall recon/exploit tooling "for the agent." The attacking agent is a separate
+environment the harness brings — its own sandbox (workspace = `solver_root`, its own
+tools), hitting the world only over the network. Hardening the world container that now
+runs real RCE (resource/privilege limits, egress, flag-out-of-image) is
+[#265](https://github.com/vecna-labs/open-range/issues/265); sandboxing the `exec`'d
+*verifier source* is the separate, host-side
+[#202](https://github.com/vecna-labs/open-range/issues/202).
