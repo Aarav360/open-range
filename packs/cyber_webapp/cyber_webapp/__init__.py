@@ -24,6 +24,7 @@ from cyber_webapp.invariants import (
 from cyber_webapp.ontology import ONTOLOGY_ID, webapp_ontology
 from cyber_webapp.realize import (
     ContainerWebappRuntime,
+    NetworkedContainerWebappRuntime,
     WebappRuntime,
     WebappRuntimeError,
 )
@@ -58,6 +59,11 @@ class WebappPack(Pack):
         backing: Backing,
     ) -> RuntimeHandle:
         if backing is Backing.CONTAINER:
+            # A *networked* world — one whose flag is reachable only by pivoting from
+            # the public service to an internal one — runs as one container per service
+            # on a network. Single-host worlds stay one container.
+            if _is_networked(graph):
+                return NetworkedContainerWebappRuntime(graph, backing)
             return ContainerWebappRuntime(graph, backing)
         return WebappRuntime(graph, backing)
 
@@ -65,9 +71,28 @@ class WebappPack(Pack):
         return [WebappBuild(), WebappPentest()]
 
 
+def _is_networked(graph: WorldGraph) -> bool:
+    # Networked = the flag is reachable only by pivoting: an SSRF on a PUBLIC service
+    # reaches an internal service that holds the flag. A vuln co-located with the flag
+    # on one service is not networked — it stays single-container.
+    public_services = {
+        n.id for n in graph.by_kind("service") if n.attrs.get("exposure") == "public"
+    }
+    service_of_endpoint = {
+        e.dst: e.src for e in graph.edges.values() if e.kind == "exposes"
+    }
+    return any(
+        service_of_endpoint.get(edge.dst) in public_services
+        for vuln in graph.by_kind("vulnerability")
+        if vuln.attrs.get("kind") == "ssrf"
+        for edge in graph.out_edges(vuln.id, "affects")
+    )
+
+
 __all__ = [
     "ONTOLOGY_ID",
     "ContainerWebappRuntime",
+    "NetworkedContainerWebappRuntime",
     "WebappBuild",
     "WebappBuilder",
     "WebappPack",
