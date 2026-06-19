@@ -34,6 +34,12 @@ or-runs/
 # JavaScript
 node_modules/
 
+# Graphify knowledge graph output
+graphify-out/
+
+# Local Claude Code instructions
+CLAUDE.md
+
 # Other
 /AGENTS.md
 TASKLIST.md
