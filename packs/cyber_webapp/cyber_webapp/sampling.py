@@ -575,7 +575,7 @@ def sample_graph(
         _lateralize(graph, rng)
     else:
         _networkize_ssrf(graph)
-    if company:
+    if company and _recon_disclosure(prior) != "none":
         _add_recon_disclosure(graph, rng)
 
     return graph
@@ -587,6 +587,12 @@ def _is_company(prior: PackPrior | None) -> bool:
 
 def _is_lateral(prior: PackPrior | None) -> bool:
     return bool(prior is not None and prior.topology.get("lateral"))
+
+
+def _recon_disclosure(prior: PackPrior | None) -> str:
+    if prior is None:
+        return "full"
+    return str(prior.topology.get("recon_disclosure", "full"))
 
 
 def _add_networks(graph: WorldGraph, company: bool) -> None:
@@ -1123,6 +1129,13 @@ def _networkize_ssrf(graph: WorldGraph) -> None:
     params["internal_decimal"] = ""  # the target is a hostname, not an IP
     if params.get("ssrf_filter") == "decimal_ip":
         params["ssrf_filter"] = "host_allowlist"
+    # The host-confirm banner answers from this inventory, so a blind agent can tell
+    # a real internal host from a typo without the flag leaking.
+    params["internal_inventory"] = sorted(
+        str(n.attrs.get("name"))
+        for n in graph.by_kind("service")
+        if n.attrs.get("exposure") != "public"
+    )
     ssrf.attrs["params"] = params
 
     # The internal half: a metadata endpoint on the flag service that serves the flag,

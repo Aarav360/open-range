@@ -58,13 +58,12 @@ class WebappBuilder(ProceduralBuilder):
         count_ranges = dict(topology.get("count_ranges") or {})
         kind_weights = dict(topology.get("kind_weights") or {})
         if company:
-            # A medium-company estate the agent recons and pivots through: more
-            # services. ``service_count`` / ``vuln_count`` are tunable (a manifest
-            # ``scale`` still wins below); the recon disclosure and the internal/dmz
-            # segmentation are added by the sampler off ``preset``. ``lateral_movement``
-            # swaps the direct pivot for a credential-reuse chain (the SSRF proxy +
-            # an internal credential leak gating the flag on a separate internal db).
+            # Company preset: a multi-service estate to recon and pivot through.
+            # Counts are setdefaults so a manifest ``scale`` still wins below;
+            # ``lateral_movement`` swaps the direct pivot for a credential-reuse chain.
             topology["preset"] = "company"
+            if manifest.get("recon_disclosure") == "none":
+                topology["recon_disclosure"] = "none"
             if lateral:
                 topology["lateral"] = True
             count_ranges.setdefault("service_count", {"min": 6, "max": 8})
