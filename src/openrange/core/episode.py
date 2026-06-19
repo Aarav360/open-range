@@ -8,11 +8,12 @@ import threading
 import time
 import uuid
 import weakref
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from openrange_pack_sdk import (
     NPC,
@@ -21,6 +22,7 @@ from openrange_pack_sdk import (
     EpisodeResult,
     OpenRangeError,
     Pack,
+    PoolableRuntime,
     RuntimeHandle,
     Snapshot,
     TaskSpec,
@@ -195,6 +197,7 @@ class EpisodeService:
         npc_agent_backend: AgentBackend | None = None,
         npc_llm_model: str | None = None,
         backing: Backing = Backing.PROCESS,
+        warm_capacity: int = 1,
     ) -> None:
         self.pack = pack
         self.run_root = Path(run_root)
@@ -213,6 +216,10 @@ class EpisodeService:
         else:
             self.npc_agent_backend = None
         self._episodes: dict[str, _RunningEpisode] = {}
+        # LRU of booted worlds; capacity below a round's distinct-world
+        # count thrashes (boot-evict-boot).
+        self._warm: OrderedDict[str, RuntimeHandle] = OrderedDict()
+        self._warm_capacity = max(1, warm_capacity)
         # Cached reports for stopped episodes — populated by
         # ``stop_episode`` so ``check_episode`` keeps working after the
         # running entry is evicted.
@@ -240,9 +247,8 @@ class EpisodeService:
         episode_root.mkdir(parents=True)
 
         started_at = time.perf_counter()
-        runtime = self.pack.realize(snapshot.graph, self.backing)
+        runtime = self._acquire_runtime(snapshot)
         try:
-            runtime.reset()
             surface_mapping = MappingProxyType(dict(runtime.surface()))
         except Exception:
             with contextlib.suppress(Exception):
@@ -278,6 +284,42 @@ class EpisodeService:
             self._start_auto_tick(running, rate)
         return handle
 
+    def _acquire_runtime(self, snapshot: Snapshot) -> RuntimeHandle:
+        warm = self._warm.pop(snapshot.snapshot_id, None)
+        if warm is not None:
+            try:
+                cast(PoolableRuntime, warm).reset_episode()
+                return warm
+            except Exception:
+                with contextlib.suppress(Exception):
+                    warm.stop()
+        runtime = self.pack.realize(snapshot.graph, self.backing)
+        try:
+            runtime.reset()
+        except Exception:
+            with contextlib.suppress(Exception):
+                runtime.stop()
+            raise
+        return runtime
+
+    def _stash_warm(self, running: _RunningEpisode) -> bool:
+        if not _is_poolable(running.runtime):
+            return False
+        snapshot_id = running.snapshot.snapshot_id
+        self._warm[snapshot_id] = running.runtime
+        self._warm.move_to_end(snapshot_id)
+        while len(self._warm) > self._warm_capacity:
+            _, evicted = self._warm.popitem(last=False)
+            with contextlib.suppress(Exception):
+                evicted.stop()
+        return True
+
+    def _evict_warm(self) -> None:
+        while self._warm:
+            _, runtime = self._warm.popitem()
+            with contextlib.suppress(Exception):
+                runtime.stop()
+
     def stop_episode(self, episode: EpisodeHandle) -> EpisodeReport:
         """Stop the runtime, run the success check, return the report.
         A second call returns the cached report; does not re-stop. The
@@ -302,15 +344,16 @@ class EpisodeService:
         episode_result = self._check_success(running, final_state)
         running.episode_result = episode_result
         running.stopped_at = time.perf_counter()
-        try:
-            running.runtime.stop()
-        except Exception as exc:  # noqa: BLE001
-            # A failed stop must not mask the solver's result.
-            self._record_system(
-                running,
-                {"stop_error": type(exc).__name__},
-                observation={"reason": str(exc)},
-            )
+        if not self._stash_warm(running):
+            try:
+                running.runtime.stop()
+            except Exception as exc:  # noqa: BLE001
+                # A failed stop must not mask the solver's result.
+                self._record_system(
+                    running,
+                    {"stop_error": type(exc).__name__},
+                    observation={"reason": str(exc)},
+                )
         running.stopped = True
         self._record_system(
             running,
@@ -679,7 +722,7 @@ class EpisodeService:
         running.tick_stop = None
 
     def close(self) -> None:
-        """Best-effort stop of all live episodes."""
+        """Best-effort stop of all live episodes and warm (pooled) worlds."""
         for running in list(self._episodes.values()):
             self._stop_auto_tick(running)
             self._stop_npcs(running)
@@ -688,6 +731,7 @@ class EpisodeService:
                     running.runtime.stop()
                 running.stopped = True
         self._episodes.clear()
+        self._evict_warm()
 
 
 def _resolve_task(snapshot: Snapshot, task_id: str | None) -> TaskSpec:
@@ -765,6 +809,11 @@ def _atexit_stop_episodes(svc_ref: weakref.ref[EpisodeService]) -> None:
         except Exception:  # noqa: BLE001 — best-effort cleanup
             continue
         running.stopped = True
+    svc._evict_warm()
+
+
+def _is_poolable(runtime: RuntimeHandle) -> bool:
+    return isinstance(runtime, PoolableRuntime) and runtime.poolable()
 
 
 def _auto_tick_loop(

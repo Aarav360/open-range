@@ -5,7 +5,7 @@ SWE episodes (per ``.rules``, no mocks): the actuators mutate a real
 ``solver_root``, the reward bridge grades the real edited tree through
 ``episode_reward``, and the variance policy reads real ``EpisodeReport``s. This
 proves the integration is correct — it does not measure a model (that is the
-``examples/trl_grpo_lora.ipynb`` notebook + the gated ``tests/test_trl_live.py``).
+gated ``tests/test_trl_live.py``).
 
 Some tests stop a real episode, which shells out to a sandboxed pytest to grade —
 the same path the SWE pack's own tests take.
@@ -17,12 +17,9 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
-from openrange_pack_sdk import EpisodeResult, Snapshot
+from openrange_pack_sdk import Backing, EpisodeResult, Snapshot
 from openrange_trl import (
     EpisodeEnv,
-    FileWorkspaceTools,
-    OpenRangeEnv,
-    WorkspaceError,
     build_grpo_dataset,
     env_trajectory,
     make_environment_factory,
@@ -32,11 +29,12 @@ from openrange_trl import (
 from swe import SwePack
 from swe.instances import load_instance
 
+from examples.tools import FILE_TOOLS, FileWorkspaceTools, WorkspaceError
 from openrange.core.admit import AdmissionFailure, admit
 from openrange.core.curriculum import auto_evolve
 from openrange.core.episode import EpisodeReport, EpisodeService
 
-EnvMaker = Callable[[str], tuple[OpenRangeEnv, Snapshot]]
+EnvMaker = Callable[[str], tuple[EpisodeEnv, Snapshot]]
 
 
 def _admit(instance: str) -> Snapshot:
@@ -51,11 +49,15 @@ def make_env(tmp_path: Path) -> Iterator[EnvMaker]:
     every service is closed on teardown so no grading subprocess leaks."""
     services: list[EpisodeService] = []
 
-    def _make(instance: str) -> tuple[OpenRangeEnv, Snapshot]:
+    def _make(instance: str) -> tuple[EpisodeEnv, Snapshot]:
         snapshot = _admit(instance)
         service = EpisodeService(SwePack(), tmp_path / f"svc{len(services)}")
         services.append(service)
-        env = OpenRangeEnv(service=service, snapshots={snapshot.snapshot_id: snapshot})
+        env = EpisodeEnv(
+            service=service,
+            snapshots={snapshot.snapshot_id: snapshot},
+            tools=FILE_TOOLS,
+        )
         return env, snapshot
 
     yield _make
@@ -63,19 +65,43 @@ def make_env(tmp_path: Path) -> Iterator[EnvMaker]:
         service.close()
 
 
-def _solve(env: OpenRangeEnv, instance: str) -> None:
+def _solve(env: EpisodeEnv, instance: str) -> None:
     for path, content in load_instance(instance).gold_files.items():
         env.write_file(path, content)
 
 
+def test_factories_thread_backing_into_each_rollout_service(tmp_path: Path) -> None:
+    # The factory builds each service before any realize, so the backing it threads
+    # through is observable without booting docker — and the default must stay PROCESS.
+    snapshot = _admit("calc_sum")
+    default_factory = make_environment_factory(
+        SwePack(), [snapshot], tmp_path / "proc", tools=FILE_TOOLS
+    )
+    container_factory = make_environment_factory(
+        SwePack(),
+        [snapshot],
+        tmp_path / "cont",
+        tools=FILE_TOOLS,
+        backing=Backing.CONTAINER,
+    )
+    proc_env = default_factory()
+    cont_env = container_factory()
+    try:
+        assert proc_env.service.backing is Backing.PROCESS
+        assert cont_env.service.backing is Backing.CONTAINER
+    finally:
+        proc_env.service.close()
+        cont_env.service.close()
+
+
 def test_base_env_resets_with_no_tools(tmp_path: Path) -> None:
-    # The tool-less EpisodeEnv base is usable directly: reset starts a real
-    # episode and returns the default observation (subclasses override it).
+    # The env is usable with no tools at all: reset starts a real episode and
+    # returns the live interface contract (here, the SWE workspace listing).
     snapshot = _admit("calc_sum")
     service = EpisodeService(SwePack(), tmp_path / "base")
     env = EpisodeEnv(service=service, snapshots={snapshot.snapshot_id: snapshot})
     try:
-        assert env.reset() == "Environment ready."
+        assert env.reset().startswith("Workspace ready")
     finally:
         service.close()
 
@@ -280,9 +306,9 @@ class TestRewardSpread:
 
     def _reward_after(
         self,
-        env: OpenRangeEnv,
+        env: EpisodeEnv,
         snapshot: Snapshot,
-        edit: Callable[[OpenRangeEnv], object],
+        edit: Callable[[EpisodeEnv], object],
     ) -> float:
         env.reset(snapshot_id=snapshot.snapshot_id)
         edit(env)
@@ -379,7 +405,9 @@ class TestTrajectoryExport:
 class TestEnvFactory:
     def test_factory_isolates_concurrent_envs(self, tmp_path: Path) -> None:
         snapshot = _admit("calc_sum")
-        factory = make_environment_factory(SwePack(), [snapshot], tmp_path)
+        factory = make_environment_factory(
+            SwePack(), [snapshot], tmp_path, tools=FILE_TOOLS
+        )
         a, b = factory(), factory()
         try:
             a.reset(snapshot_id=snapshot.snapshot_id)

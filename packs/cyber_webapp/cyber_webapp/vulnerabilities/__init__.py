@@ -227,6 +227,102 @@ WEAK_CREDENTIALS = Vulnerability(
 )
 
 
+METADATA_CREDENTIAL_LEAK = Vulnerability(
+    id="metadata_credential_leak",
+    family="code_web",
+    description=(
+        "An unauthenticated internal endpoint (cloud-metadata / admin style) returns a "
+        "secret on a plain GET. Not reachable from outside; it is the resource an SSRF "
+        "on a public service pivots to — the internal half of the networked SSRF chain."
+    ),
+    target_kinds=frozenset({"endpoint"}),
+    template="metadata_credential_leak.py.j2",
+    shape="response_leak",
+    attrs_schema={},
+)
+
+
+CONFIG_DISCLOSURE = Vulnerability(
+    id="config_disclosure",
+    family="code_web",
+    description=(
+        "A public status/config endpoint over-shares internal infrastructure — it "
+        "names the internal hosts the app can reach. Recon for the SSRF pivot, not a "
+        "flag leak: it discloses the candidate internal targets, never the secret. "
+        "Placed only on a company world's public service, never by general sampling."
+    ),
+    target_kinds=frozenset({"endpoint"}),
+    template="config_disclosure.py.j2",
+    shape="response_leak",
+    attrs_schema={
+        "internal_services": "internal hostnames disclosed (the SSRF's targets)",
+        "internal_path": "the internal metadata path the disclosure names",
+    },
+)
+
+
+CREDENTIAL_LEAK = Vulnerability(
+    id="credential_leak",
+    family="code_web",
+    description=(
+        "An unauthenticated internal endpoint hands out a service credential (a db "
+        "token) on a plain GET. Reachable only by pivoting; the leaked token is the "
+        "intermediate loot the agent reuses to reach the internal DB. The internal "
+        "half of a lateral-movement chain — never placed by general sampling."
+    ),
+    target_kinds=frozenset({"endpoint"}),
+    template="credential_leak.py.j2",
+    shape="response_leak",
+    attrs_schema={
+        "credential": "the db token this endpoint discloses",
+        "vault_host": "internal host the token authenticates to",
+        "vault_path": "path on that host the token opens",
+        "token_param": "query parameter the token must be presented in",
+    },
+)
+
+
+CREDENTIAL_GATED_FLAG = Vulnerability(
+    id="credential_gated_flag",
+    family="code_web",
+    description=(
+        "An internal data endpoint that serves the flag only to a caller presenting "
+        "the db token leaked elsewhere — the lateral-movement target. Solvable only by "
+        "reusing the credential moved over from the metadata host. Never placed by "
+        "general sampling."
+    ),
+    target_kinds=frozenset({"endpoint"}),
+    template="credential_gated_flag.py.j2",
+    shape="response_leak",
+    attrs_schema={
+        "credential": "the db token a caller must present",
+        "token_param": "query parameter the token is read from",
+    },
+)
+
+
+CREDENTIAL_GATED_RELAY = Vulnerability(
+    id="credential_gated_relay",
+    family="code_web",
+    description=(
+        "An intermediate internal relay: validates the reused db token, then hands "
+        "over the NEXT host's credential and how to reach it. One composable hop of an "
+        "arbitrary-depth lateral chain. Never placed by general sampling."
+    ),
+    target_kinds=frozenset({"endpoint"}),
+    template="credential_gated_relay.py.j2",
+    shape="response_leak",
+    attrs_schema={
+        "credential": "the db token a caller must present to pass this hop",
+        "token_param": "query parameter the token is read from",
+        "next_credential": "the credential handed over for the next host",
+        "next_vault_host": "the next host on the chain",
+        "next_vault_path": "the next host's gated path",
+        "next_token_param": "the query parameter the next host reads its token from",
+    },
+)
+
+
 CATALOG: Mapping[str, Vulnerability] = {
     SQL_INJECTION.id: SQL_INJECTION,
     SSRF.id: SSRF,
@@ -237,6 +333,11 @@ CATALOG: Mapping[str, Vulnerability] = {
     SSTI.id: SSTI,
     IDOR.id: IDOR,
     WEAK_CREDENTIALS.id: WEAK_CREDENTIALS,
+    METADATA_CREDENTIAL_LEAK.id: METADATA_CREDENTIAL_LEAK,
+    CONFIG_DISCLOSURE.id: CONFIG_DISCLOSURE,
+    CREDENTIAL_LEAK.id: CREDENTIAL_LEAK,
+    CREDENTIAL_GATED_FLAG.id: CREDENTIAL_GATED_FLAG,
+    CREDENTIAL_GATED_RELAY.id: CREDENTIAL_GATED_RELAY,
 }
 
 
@@ -309,7 +410,12 @@ __all__ = [
     "BROKEN_AUTHZ",
     "CATALOG",
     "COMMAND_INJECTION",
+    "CONFIG_DISCLOSURE",
+    "CREDENTIAL_GATED_FLAG",
+    "CREDENTIAL_GATED_RELAY",
+    "CREDENTIAL_LEAK",
     "IDOR",
+    "METADATA_CREDENTIAL_LEAK",
     "PATH_TRAVERSAL",
     "SQL_INJECTION",
     "SSRF",

@@ -47,6 +47,11 @@ def test_catalog_has_starter_vulns() -> None:
         "ssti",
         "idor",
         "weak_credentials",
+        "metadata_credential_leak",
+        "config_disclosure",
+        "credential_leak",
+        "credential_gated_flag",
+        "credential_gated_relay",
     }
     assert vuln("sql_injection") is SQL_INJECTION
 
@@ -63,6 +68,11 @@ def test_vulns_for_kind_filters_by_target() -> None:
         "ssti",
         "idor",
         "weak_credentials",
+        "metadata_credential_leak",
+        "config_disclosure",
+        "credential_leak",
+        "credential_gated_flag",
+        "credential_gated_relay",
     }
     assert vulns_for_kind("network") == ()
 
@@ -212,6 +222,87 @@ def test_ssrf_reaches_internal_host_and_leaks() -> None:
     status, _, body = handle({"url": ["http://169.254.169.254/"]}, state)
     assert status == 200
     assert b"ORANGE{ssrf_leaked}" not in body
+
+
+def test_ssrf_networked_fetches_the_internal_host_for_real() -> None:
+    """Under OPENRANGE_NETWORKED the handler opens a real socket to the internal
+    host instead of reading the secret in-process — the flag comes off the wire."""
+    import http.server
+    import os
+    import threading
+
+    served = b'{"credential": "ORANGE{networked_fetch}"}'
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(served)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    try:
+        server = http.server.HTTPServer(("127.0.0.1", 8000), _Handler)
+    except OSError:
+        pytest.skip("port 8000 unavailable for the internal-host stand-in")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        src = render_vulnerability(
+            SSRF,
+            {
+                "target_param": "url",
+                "internal_host": "127.0.0.1",
+                "internal_path": "/latest/meta-data/credential",
+                "allowed_host": "ok.example.com",
+                "ssrf_filter": "host_allowlist",
+            },
+        )
+        handle = _exec_handler(src)
+        os.environ["OPENRANGE_NETWORKED"] = "1"
+        try:
+            status, _, body = handle(
+                {
+                    "url": [
+                        "http://ok.example.com@127.0.0.1/latest/meta-data/credential"
+                    ]
+                },
+                {"secrets": {"flag": "ORANGE{in_process_should_not_appear}"}},
+            )
+        finally:
+            os.environ.pop("OPENRANGE_NETWORKED", None)
+    finally:
+        server.shutdown()
+    assert status == 200
+    assert b"ORANGE{networked_fetch}" in body  # the secret came across the network
+    assert b"in_process_should_not_appear" not in body  # not the shared-state read
+
+
+def test_ssrf_networked_502_when_internal_unreachable() -> None:
+    import os
+
+    src = render_vulnerability(
+        SSRF,
+        {
+            "target_param": "url",
+            "internal_host": "no-such-host.invalid",  # RFC 2606: never resolves
+            "internal_path": "/x",
+            "allowed_host": "ok.example.com",
+            "ssrf_filter": "host_allowlist",
+        },
+    )
+    handle = _exec_handler(src)
+    os.environ["OPENRANGE_NETWORKED"] = "1"
+    try:
+        status, _, body = handle(
+            {"url": ["http://ok.example.com@no-such-host.invalid/x"]},
+            {"secrets": {"flag": "unused"}},
+        )
+    finally:
+        os.environ.pop("OPENRANGE_NETWORKED", None)
+    assert status == 502
+    assert b"ssrf fetch failed" in body
 
 
 def test_ssrf_post_hoc_allowlist_lets_through_matching_url() -> None:

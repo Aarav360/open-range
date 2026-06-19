@@ -421,14 +421,106 @@ def test_auto_evolve_picks_highest_relevance_in_direction() -> None:
     assert "vuln.sqli" in out.graph.nodes
     # The original snapshot is untouched (re-admission must not mutate).
     assert "ep.high" not in snap.graph.nodes
-    # Lineage carries the parent snapshot id so callers can chain.
-    out_manifest = out.lineage["manifest"]
-    assert isinstance(out_manifest, Mapping)
-    evolve_meta = out_manifest.get("_evolve")
+    evolve_meta = out.lineage["_evolve"]
     assert isinstance(evolve_meta, Mapping)
     assert evolve_meta["parent_snapshot_id"] == snap.snapshot_id
     assert evolve_meta["direction"] == "harden"
+    assert evolve_meta["kind"] == "patch"
+    assert evolve_meta["relevance"] == 0.9
+    assert evolve_meta["family"] == "stub.family"
     assert evolve_meta["note"] == "high"
+    out_manifest = out.lineage["manifest"]
+    assert isinstance(out_manifest, Mapping)
+    assert "_evolve" not in out_manifest
+
+
+def test_evolve_block_is_one_schema_across_paths() -> None:
+    # Grow leaves relevance/family present-but-None so callers keying on them
+    # never KeyError across paths.
+    from openrange.core.curriculum import _evolve_block
+
+    keys = {"parent_snapshot_id", "direction", "kind", "relevance", "family", "note"}
+    grow = _evolve_block(parent_snapshot_id="p", direction="harden", kind="grow")
+    patch = _evolve_block(
+        parent_snapshot_id="p",
+        direction="harden",
+        kind="patch",
+        relevance=0.7,
+        family="webapp.pentest",
+        note="add x",
+    )
+    assert set(grow) == keys
+    assert set(patch) == keys
+    assert grow["relevance"] is None
+    assert grow["family"] is None
+    assert patch["relevance"] == 0.7
+
+
+def test_auto_evolve_gate_skips_rejected_candidate() -> None:
+    """A gate vetoing the top candidate (e.g. a 'harden' add that actually
+    leaks the flag → easier) makes auto_evolve fall through to the next."""
+    low_patch = GraphPatch(
+        nodes_added=[Node("ep.low", "endpoint", attrs={"path": "/low"})],
+        edges_added=[Edge("e.low", "exposes", "repo.a", "ep.low")],
+    )
+    high_patch = GraphPatch(
+        nodes_added=[Node("ep.high", "endpoint", attrs={"path": "/high"})],
+        edges_added=[Edge("e.high", "exposes", "repo.a", "ep.high")],
+    )
+    family = _StubFamily(
+        mutations=(
+            Mutation(
+                patch=low_patch,
+                direction="harden",
+                relevance=0.2,
+                family="stub.family",
+                note="low",
+            ),
+            Mutation(
+                patch=high_patch,
+                direction="harden",
+                relevance=0.9,
+                family="stub.family",
+                note="high",
+            ),
+        ),
+    )
+    snap, pack = _build_stub_snapshot(family)
+
+    seen: list[str] = []
+
+    def gate(evolved: Snapshot, mutation: Mutation) -> bool:
+        seen.append(mutation.note)
+        return mutation.note != "high"  # reject the leaking top pick
+
+    out = auto_evolve(snap, _Report(True), pack=pack, gate=gate)
+    assert isinstance(out, Snapshot), out
+    # The vetoed high-relevance add was skipped; the legitimate one landed.
+    assert "ep.high" not in out.graph.nodes
+    assert "ep.low" in out.graph.nodes
+    assert seen == ["high", "low"]  # tried highest-relevance first, then fell through
+
+
+def test_auto_evolve_gate_rejecting_all_returns_none() -> None:
+    """If the gate vetoes every candidate and no grow is possible, evolution
+    legitimately stalls (None) rather than landing a mislabelled world."""
+    patch = GraphPatch(
+        nodes_added=[Node("ep.x", "endpoint", attrs={"path": "/x"})],
+        edges_added=[Edge("e.x", "exposes", "repo.a", "ep.x")],
+    )
+    family = _StubFamily(
+        mutations=(
+            Mutation(
+                patch=patch,
+                direction="harden",
+                relevance=0.9,
+                family="stub.family",
+                note="x",
+            ),
+        ),
+    )
+    snap, pack = _build_stub_snapshot(family)
+    assert auto_evolve(snap, _Report(True), pack=pack, gate=lambda *_: False) is None
 
 
 def test_auto_evolve_custom_policy() -> None:
@@ -624,12 +716,11 @@ def test_auto_evolve_e2e_on_webapp_pack() -> None:
         )
     assert isinstance(out, Snapshot)
     assert out.snapshot_id != snap.snapshot_id
-    out_manifest = out.lineage["manifest"]
-    assert isinstance(out_manifest, Mapping)
-    evolve_meta = out_manifest.get("_evolve")
+    evolve_meta = out.lineage["_evolve"]
     assert isinstance(evolve_meta, Mapping)
     assert evolve_meta["parent_snapshot_id"] == snap.snapshot_id
     assert evolve_meta["direction"] == "harden"
+    assert evolve_meta["kind"] == "patch"
 
 
 def test_auto_evolve_hardens_a_build_episode() -> None:

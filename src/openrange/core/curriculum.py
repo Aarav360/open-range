@@ -62,6 +62,14 @@ def _report_passed(report: EpisodeReportLike) -> bool:
         return False
 
 
+# Returns True iff the candidate genuinely matches its claimed ``direction``.
+# The caller supplies one (typically realizing the world and checking a
+# verifier) to drop a mutation whose static label is wrong — e.g. one tagged
+# "harden" that actually makes the task easier. Without a gate, the family's
+# label is trusted.
+EvolutionGate = Callable[["Snapshot", Mutation], bool]
+
+
 def auto_evolve(
     snapshot: Snapshot,
     *reports: EpisodeReportLike,
@@ -69,6 +77,7 @@ def auto_evolve(
     policy: CurriculumPolicy = direction_from_reports,
     llm: LLMBackend | None = None,
     max_repairs: int = 2,
+    gate: EvolutionGate | None = None,
 ) -> Snapshot | None:
     """Pick an evolution for ``direction`` and re-admit it.
 
@@ -76,6 +85,10 @@ def auto_evolve(
     world, falls back to a builder *grow* (re-running the builder with a
     difficulty-stepped prior). Returns the next Snapshot, or ``None`` if nothing
     admits.
+
+    ``gate``, when given, vets each admitted candidate against its claimed
+    ``direction`` (see :data:`EvolutionGate`); a rejected candidate is skipped
+    so a mislabelled mutation never lands.
     """
     if not reports:
         return None
@@ -89,9 +102,18 @@ def auto_evolve(
             evolved = _evolve_snapshot(snapshot, pack, chosen, max_repairs=max_repairs)
         except Exception:  # noqa: BLE001 — pack-supplied code is untrusted
             continue
-        if evolved is not None and evolved.snapshot_id != snapshot.snapshot_id:
-            return evolved
+        if evolved is None or evolved.snapshot_id == snapshot.snapshot_id:
+            continue
+        if gate is not None:
+            try:
+                if not gate(evolved, chosen):
+                    continue
+            except Exception:  # noqa: BLE001 — caller-supplied gate is untrusted
+                continue
+        return evolved
 
+    # Intentionally outside the gate: a pack using grow for a monotone frontier
+    # must keep ``default_prior`` None so this fallback never fires there.
     try:
         return _grow_snapshot(snapshot, pack, direction, max_repairs=max_repairs)
     except Exception:  # noqa: BLE001 — pack-supplied code is untrusted
@@ -171,6 +193,26 @@ def _grow_snapshot(
     return grown
 
 
+def _evolve_block(
+    *,
+    parent_snapshot_id: str,
+    direction: str,
+    kind: str,
+    relevance: float | None = None,
+    family: str | None = None,
+    note: str = "",
+) -> dict[str, object]:
+    # Absent fields are explicit None, not omitted, so every path shares one schema.
+    return {
+        "parent_snapshot_id": parent_snapshot_id,
+        "direction": direction,
+        "kind": kind,
+        "relevance": relevance,
+        "family": family,
+        "note": note,
+    }
+
+
 def _with_grow_lineage(
     result: Snapshot,
     parent: Snapshot,
@@ -194,11 +236,11 @@ def _with_grow_lineage(
         lineage={
             **dict(result.lineage),
             "curriculum_difficulty": difficulty,
-            "_evolve": {
-                "parent_snapshot_id": parent.snapshot_id,
-                "direction": direction,
-                "kind": "grow",
-            },
+            "_evolve": _evolve_block(
+                parent_snapshot_id=parent.snapshot_id,
+                direction=direction,
+                kind="grow",
+            ),
         },
         history=(*result.history, event),
     )
@@ -234,17 +276,7 @@ def _evolve_snapshot(
         regenerated.extend(family.generate(evolved_graph, base_manifest, None))
 
     wrapped = _PreBuiltPack(pack, evolved_graph, regenerated)
-    evolved_manifest = {
-        **base_manifest,
-        "_evolve": {
-            "parent_snapshot_id": snapshot.snapshot_id,
-            "direction": mutation.direction,
-            "relevance": mutation.relevance,
-            "family": mutation.family,
-            "note": mutation.note,
-        },
-    }
-    result = admit(wrapped, manifest=evolved_manifest, max_repairs=max_repairs)
+    result = admit(wrapped, manifest=dict(base_manifest), max_repairs=max_repairs)
     if isinstance(result, AdmissionFailure):
         return None
     assert isinstance(result, _Snapshot)
@@ -266,6 +298,14 @@ def _evolve_snapshot(
     lineage = dict(result.lineage)
     if isinstance(carried, dict):
         lineage.setdefault("curriculum_difficulty", carried)
+    lineage["_evolve"] = _evolve_block(
+        parent_snapshot_id=snapshot.snapshot_id,
+        direction=mutation.direction,
+        kind="patch",
+        relevance=mutation.relevance,
+        family=mutation.family,
+        note=mutation.note,
+    )
     return _Snapshot(
         snapshot_id=result.snapshot_id,
         ontology_id=result.ontology_id,

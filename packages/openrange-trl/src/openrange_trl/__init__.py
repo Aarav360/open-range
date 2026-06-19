@@ -1,30 +1,30 @@
 """TRL GRPO adapter — torch-free.
 
 The whole adapter lives here and imports only ``openrange`` + stdlib, so
-``import openrange_trl`` works with no ``torch`` installed and every
-piece below is deterministically unit-testable without a model. Only the gated
+``import openrange_trl`` works with no ``torch`` installed and every piece below
+is deterministically unit-testable without a model. Only the gated
 ``tests/test_trl_live.py`` and the example notebooks (``examples/trl_grpo_*``)
 import ``trl`` / ``torch`` and build a real ``GRPOTrainer``.
 
-The core public pieces map onto TRL's agentic GRPO (the ``environment_factory``
-path, ``transformers>=5.2``):
+OpenRange owns the world + the grade; it owns nothing of the agent runtime. So
+the policy's **tools are brought by the caller** (the user's harness), not
+hard-coded here. A tool is a plain callable taking the live episode ``surface``
+first, then the model's kwargs — this package ships the *mechanism* only, no
+tools (``examples/tools.py`` has reference shims for the shell-less in-process
+policy). The core public pieces map onto TRL's agentic GRPO
+(the ``environment_factory`` path, ``transformers>=5.2``):
 
-- ``OpenRangeEnv`` — one rollout's environment. ``reset(**row)`` starts a fresh
-  ``EpisodeService`` episode and returns the live workspace listing (appended to
-  the prompt); its public tool methods (``read_file`` / ``write_file`` /
-  ``list_dir`` / ``apply_patch`` / ``run_tests``) are what TRL exposes to the
-  policy as tools; the first read of ``env.reward`` (via the reward func) lazily
-  stops + grades the episode through ``episode_reward``.
-- ``WebTargetEnv`` — the sibling env for tasks against a *live web target*: same
-  lifecycle, different action surface (``http_get`` to probe the running service,
-  ``submit`` to write the answer the pack grades). The cyber webapp pack trains
-  through this one; pair it with ``make_web_environment_factory``.
-- ``FileWorkspaceTools`` — the sandboxed, path-traversal-guarded file IO the SWE
-  *surface* never exposed (gap C): a tool-calling policy can now *change* the
-  graded state, not just observe it. Harness-neutral, no TRL import.
+- ``EpisodeEnv`` — one rollout's environment over an ``EpisodeService`` episode.
+  Constructed with the caller's ``tools``; it synthesizes one TRL-introspectable
+  method per tool (so the trainer reflects them as the policy's tool surface) and
+  binds each to the live ``surface`` at ``reset``. The first read of
+  ``env.reward`` (via the reward func) lazily stops + grades the episode.
 - ``build_grpo_dataset`` — a snapshot's tasks → GRPO prompt rows, each tagged
   with ``snapshot_id`` / ``task_id`` so trajectories stay attributable across an
-  ``auto_evolve`` curriculum.
+  ``auto_evolve`` curriculum. The model sees the tools via TRL's tool schemas, so
+  a row carries just the task instruction.
+- ``make_environment_factory`` — the per-rollout factory TRL calls; the caller
+  passes the ``tools`` the policy gets.
 - ``make_reward_func`` — the TRL-shaped reward bridge; defers entirely to the
   pack's structured grade via ``episode_reward`` (no reward logic reinvented).
 - ``reward_variance_policy`` — a ``CurriculumPolicy`` keyed on the signal GRPO
@@ -34,14 +34,16 @@ path, ``transformers>=5.2``):
 
 from __future__ import annotations
 
+import copy
+import inspect
+import subprocess
+import types
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from typing import TYPE_CHECKING, Any
 
-from openrange_pack_sdk import EpisodeReportLike, Pack, Snapshot, TaskSpec
+from openrange_pack_sdk import Backing, EpisodeReportLike, Pack, Snapshot
 
 from openrange.core.curriculum import Direction
 from openrange.core.episode import (
@@ -50,122 +52,66 @@ from openrange.core.episode import (
     EpisodeReport,
     EpisodeService,
 )
+from openrange.pool import PromptRow, RoundReports, RunRound
 from openrange.training import (
     Reward,
     Trajectory,
     episode_reward,
     episode_trajectory,
 )
+from openrange_trl.sandbox import (
+    SANDBOX_LABEL,
+    AgentSandbox,
+    CommandResult,
+    SandboxError,
+    track_resource,
+    untrack_resource,
+)
 
-# Tail tool output so a chatty suite can't flood a tiny model's context window.
+Tool = Callable[..., str]
+
+# Tail tool output so a chatty surface can't flood the context window.
 _OUTPUT_TAIL = 2000
 
-_TOOL_GUIDE = (
-    "You are solving a coding task in a sandboxed workspace. Use these tools:\n"
-    "- list_dir(path): list a directory (default '.')\n"
-    "- read_file(path): read a UTF-8 text file\n"
-    "- write_file(path, content): create or overwrite a file\n"
-    "- apply_patch(path, find, replace): replace exact text in a file\n"
-    "- run_tests(node_ids): run pytest; node_ids is space-separated targets, "
-    "empty runs all\n"
-    "Edit files until the task is solved, then stop. A held-out test suite "
-    "grades your final workspace."
-)
 
-_HTTP_TIMEOUT = 5
+def _tool_method(env: EpisodeEnv, fn: Tool) -> Any:
+    """Build a TRL-introspectable bound method from a user tool fn.
 
-WEB_TOOL_GUIDE = (
-    "You are probing a live web service. Use these tools:\n"
-    "- http_get(path): send an HTTP GET (include any query string) and read the "
-    "response status + body\n"
-    "- submit(content): submit your final answer as a JSON object, e.g. "
-    '{"flag": "<the value you recovered>"}\n'
-    "Investigate the service, then submit. A held-out grader checks your answer."
-)
-
-
-class WorkspaceError(Exception):
-    """A file actuator call that can't be honored — most importantly a path that
-    escapes the workspace root, but also a missing file or a not-yet-reset env.
-
-    Raised by ``FileWorkspaceTools`` and caught at the ``OpenRangeEnv`` tool
-    boundary, which turns it into an error string (fail-soft): a malformed call
-    from a weak model costs reward, never the run.
+    TRL reflects an env's public methods into tools (schema from the signature +
+    docstring). The tool takes the live ``surface`` first; we hand TRL the same
+    method with that parameter dropped and inject ``self._surface`` at call time.
     """
-
-
-class FileWorkspaceTools:
-    """Sandboxed file IO rooted at one episode's ``solver_root``.
-
-    Every path is resolved and asserted to stay under ``root`` — a
-    ``write_file("../../etc/passwd")`` raises ``WorkspaceError``. Writing
-    *inside* a throwaway temp ``solver_root`` is safe (grading already runs
-    untrusted code sandboxed); escaping it is not. Harness-neutral: no TRL
-    import, so a second trainer adapter can share it unchanged.
-    """
-
-    def __init__(self, root: str | Path) -> None:
-        self.root = Path(root).resolve()
-
-    def _resolve(self, path: str) -> Path:
-        candidate = (self.root / path).resolve()
-        if candidate != self.root and self.root not in candidate.parents:
-            raise WorkspaceError(f"path {path!r} escapes the workspace root")
-        return candidate
-
-    def read_file(self, path: str) -> str:
-        target = self._resolve(path)
-        if not target.is_file():
-            raise WorkspaceError(f"no such file: {path!r}")
-        return target.read_text(encoding="utf-8")
-
-    def write_file(self, path: str, content: str) -> str:
-        target = self._resolve(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        return f"wrote {len(content)} byte(s) to {path}"
-
-    def list_dir(self, path: str = ".") -> str:
-        target = self._resolve(path)
-        if not target.exists():
-            raise WorkspaceError(f"no such directory: {path!r}")
-        if target.is_file():
-            return path
-        names = sorted(p.name + ("/" if p.is_dir() else "") for p in target.iterdir())
-        return "\n".join(names) if names else "(empty)"
-
-    def apply_patch(self, path: str, find: str, replace: str) -> str:
-        target = self._resolve(path)
-        if not target.is_file():
-            raise WorkspaceError(f"no such file: {path!r}")
-        original = target.read_text(encoding="utf-8")
-        if find not in original:
-            raise WorkspaceError(f"patch text not found in {path!r}")
-        occurrences = original.count(find)
-        target.write_text(original.replace(find, replace), encoding="utf-8")
-        return f"patched {path} ({occurrences} occurrence(s))"
+    params = list(inspect.signature(fn).parameters.values())[1:]
+    ns: dict[str, Any] = {"_fn": fn}
+    decl, forward = "", ""
+    for p in params:
+        ns[f"_ann_{p.name}"] = p.annotation if p.annotation is not p.empty else str
+        decl += f", {p.name}: _ann_{p.name}"
+        if p.default is not p.empty:
+            ns[f"_def_{p.name}"] = p.default
+            decl += f" = _def_{p.name}"
+        forward += f", {p.name}={p.name}"
+    exec(  # noqa: S102 - source is built from the tool's own signature, not input
+        f"def {fn.__name__}(self{decl}):\n    return self._invoke(_fn{forward})\n",
+        ns,
+    )
+    method = ns[fn.__name__]
+    method.__doc__ = fn.__doc__
+    method.__annotations__["return"] = str
+    return types.MethodType(method, env)
 
 
 class EpisodeEnv:
-    """One GRPO rollout's environment over a single ``EpisodeService`` episode —
-    the pack-agnostic lifecycle, with no tools of its own.
+    """One GRPO rollout over a single ``EpisodeService`` episode.
 
-    Subclasses add the action surface, and TRL exposes a subclass's *public*
-    methods as the policy's tools — so each subclass owns exactly the tool set it
-    defines. ``OpenRangeEnv`` exposes file tools for SWE-style workspace tasks; a
-    second env can expose a different surface (e.g. HTTP tools against a live web
-    target) without changing this base. Tool methods are **fail-soft** (wrap the
-    body in ``_safe``) — they return an error string rather than raising, so a
-    weak model's bad call costs reward, not the run.
+    Each caller-supplied tool becomes a public method TRL reflects as a tool,
+    bound to the live ``surface`` at ``reset``; tool calls are fail-soft (a bad
+    call costs reward, not the run). The first read of ``env.reward`` (via the
+    reward func) lazily stops + grades the episode.
 
-    Lifecycle (mirrors TRL's agentic loop): ``reset(**row)`` starts a fresh
-    episode (each ``start_episode`` realizes its own ``solver_root`` / target, so
-    a group of N concurrent envs never collides), calls ``_setup`` so the subclass
-    can bind its tools, and returns ``_initial_observation`` (appended to the
-    prompt). The public tool methods drive the episode; the first ``_finalize``
-    (via the reward func) stops + grades the *final* state into ``self.reward``.
-    Everything but ``reset`` and the subclass's tools is underscore-prefixed (TRL
-    skips it) or a plain data attribute (``reward`` / ``turns`` / ``report``).
+    With ``sandbox=True`` each episode gets its own throwaway :class:`AgentSandbox`
+    (the agent's machine), and the live ``surface`` carries a ``run`` capability so a
+    brought tool can run commands there — the trainer never runs an agent command.
     """
 
     def __init__(
@@ -173,7 +119,9 @@ class EpisodeEnv:
         *,
         service: EpisodeService,
         snapshots: Mapping[str, Snapshot],
+        tools: Sequence[Tool] = (),
         reward_fn: Callable[[EpisodeReport], Reward] = episode_reward,
+        sandbox: bool = False,
     ) -> None:
         self.service = service
         self.snapshots = dict(snapshots)
@@ -184,8 +132,21 @@ class EpisodeEnv:
         self._handle: EpisodeHandle | None = None
         self._surface: Mapping[str, Any] | None = None
         self._finalized = False
+        self._use_sandbox = sandbox
+        self._sandbox: AgentSandbox | None = None
+        self._network: str | None = None
+        self._target_container: str | None = None
+        self._tools: dict[str, Tool] = {}
+        for fn in tools:
+            if fn.__name__ in self._tools:
+                raise ValueError(f"duplicate tool name: {fn.__name__!r}")
+            self._tools[fn.__name__] = fn
+            setattr(self, fn.__name__, _tool_method(self, fn))
 
-    # -- lifecycle -----------------------------------------------------------
+    if TYPE_CHECKING:
+        # Tools are attached dynamically, so the type checker can't see them;
+        # declare any such access as a string-returning tool call.
+        def __getattr__(self, name: str) -> Callable[..., str]: ...
 
     def reset(
         self,
@@ -194,40 +155,111 @@ class EpisodeEnv:
         task_id: str | None = None,
         **_: object,
     ) -> str:
-        """Start a fresh episode and return the initial observation.
-
-        ``snapshot_id`` / ``task_id`` come straight from the dataset row (the
-        extra columns are absorbed by ``**_``). The returned text is appended to
-        the prompt by TRL — it carries the *live* state (a workspace listing, a
-        target URL) the dataset can't know, since the world is realized only at
-        episode start.
+        """Start a fresh episode; the returned observation (the live target URL or
+        workspace listing the dataset can't know) is appended to the prompt.
+        ``snapshot_id`` / ``task_id`` come from the dataset row.
         """
+        self._teardown_sandbox()
         snapshot = self._resolve_snapshot(snapshot_id)
         handle = self.service.start_episode(snapshot, task_id)
         self._handle = handle
-        self._surface = self.service.surface(handle)
+        surface = self.service.surface(handle)
+        self._surface = self._start_sandbox(surface) if self._use_sandbox else surface
         self.reward = 0.0
         self.turns = []
         self.report = None
         self._finalized = False
-        self._setup(handle)
         return self._initial_observation()
 
-    def _setup(self, handle: EpisodeHandle) -> None:
-        """Bind the subclass's tools/state for the new episode (default: none)."""
-
     def _initial_observation(self) -> str:
-        """The reset text appended to the prompt (default: a bare ready marker)."""
-        return "Environment ready."
+        surface = self._surface or {}
+        base_url = surface.get("base_url")
+        if isinstance(base_url, str):
+            return (
+                f"A web service is running at {base_url}. Probe it with the "
+                "available tools, then submit your answer."
+            )
+        solver_root = surface.get("solver_root")
+        if solver_root is not None:
+            names = sorted(p.name for p in Path(str(solver_root)).iterdir())
+            return f"Workspace ready at {solver_root}. Files:\n" + "\n".join(names)
+        return "Environment ready. Use the available tools."
 
-    # -- grading / lifecycle internals (underscore → TRL skips these) --------
+    def _invoke(self, fn: Tool, **kwargs: Any) -> str:
+        out = self._safe(lambda: fn(self._require_surface(), **kwargs))
+        self._record(fn.__name__, kwargs, out)
+        return out[-_OUTPUT_TAIL:]
+
+    def _require_surface(self) -> Mapping[str, Any]:
+        if self._surface is None:
+            raise RuntimeError("tool called before reset()")
+        return self._surface
+
+    def _start_sandbox(self, surface: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Give the agent its own sandbox for this episode and hand it to the tools.
+
+        The agent's tools run here, never in the trainer. An HTTP world (``base_url``)
+        is a network target: the sandbox joins a private per-episode network the world
+        is also on, so the agent reaches it by alias over the wire (not the host). A
+        code world (``solver_root``) is mounted so the agent edits it as its own files.
+        Either way the live ``run`` is injected into the surface, so a brought tool can
+        call ``surface["run"](command)`` with the trainer unchanged.
+        """
+        base_url = surface.get("base_url")
+        if isinstance(base_url, str):
+            target = surface.get("target_container")
+            if not isinstance(target, str):
+                raise SandboxError(
+                    "a sandboxed HTTP world needs a containerized target (CONTAINER "
+                    "backing) so the sandbox can join its network and reach it by alias"
+                )
+            network = f"openrange-agent-net-{uuid.uuid4().hex[:12]}"
+            # --internal: the network has no gateway, so the sandbox (running untrusted
+            # agent code) can reach the target by alias yet CANNOT reach the host, the
+            # internet, or other episodes' host-published ports. The label makes a
+            # leaked network prunable; record + track the name before connect so a
+            # failed connect still tears it down (here and via the atexit sweep).
+            _run_docker(
+                "network", "create", "--internal", "--label", SANDBOX_LABEL, network
+            )
+            self._network = network
+            track_resource("network", network)
+            _run_docker("network", "connect", "--alias", "target", network, target)
+            self._target_container = target
+            target_url = f"http://target:{surface.get('target_port', '8000')}"
+            self._sandbox = AgentSandbox({"base_url": target_url}, network=network)
+            self._sandbox.start()
+            # The agent reaches the target by its in-network alias, not the host URL.
+            return {**surface, "base_url": target_url, "run": self._sandbox.run}
+        self._sandbox = AgentSandbox({"solver_root": surface.get("solver_root")})
+        self._sandbox.start()
+        return {**surface, "run": self._sandbox.run}
+
+    def _teardown_sandbox(self) -> None:
+        # Disposable: the sandbox dies with the episode so no state leaks to the next.
+        if self._sandbox is not None:
+            self._sandbox.close()
+            self._sandbox = None
+        if self._network is not None:
+            # Detach the world (best-effort: stop_episode usually removed it already),
+            # then drop the network so nothing dangles even on an un-finalized re-reset.
+            if self._target_container is not None:
+                _run_docker(
+                    "network",
+                    "disconnect",
+                    "-f",
+                    self._network,
+                    self._target_container,
+                    check=False,
+                )
+            _run_docker("network", "rm", self._network, check=False)
+            untrack_resource("network", self._network)
+            self._network = None
+            self._target_container = None
 
     def _finalize(self) -> None:
-        """Stop + grade the episode, caching the report and scalar reward.
-
-        Idempotent: the reward func may read ``env.reward`` more than once, and
-        ``stop_episode`` itself caches, so a double read is safe.
-        """
+        # Idempotent: the reward func may read env.reward more than once, and
+        # stop_episode caches, so a double read is safe.
         if self._finalized or self._handle is None:
             self._finalized = True
             return
@@ -235,6 +267,7 @@ class EpisodeEnv:
         report = self.service.stop_episode(self._handle)
         self.report = report
         self.reward = self.reward_fn(report).scalar
+        self._teardown_sandbox()
 
     def _resolve_snapshot(self, snapshot_id: str | None) -> Snapshot:
         if snapshot_id is not None:
@@ -265,221 +298,28 @@ class EpisodeEnv:
             self.service.record_turn(self._handle, turn)
 
 
-class OpenRangeEnv(EpisodeEnv):
-    """SWE-style env: the policy edits a sandboxed file workspace.
-
-    Adds the five file tools (``read_file`` / ``write_file`` / ``list_dir`` /
-    ``apply_patch`` / ``run_tests``) over the episode's ``solver_root``; the
-    ``run_tests`` tool defers to whatever ``run_tests`` callable the pack's
-    surface exposes.
-    """
-
-    def __init__(
-        self,
-        *,
-        service: EpisodeService,
-        snapshots: Mapping[str, Snapshot],
-        reward_fn: Callable[[EpisodeReport], Reward] = episode_reward,
-    ) -> None:
-        super().__init__(service=service, snapshots=snapshots, reward_fn=reward_fn)
-        self._tools: FileWorkspaceTools | None = None
-
-    def _setup(self, handle: EpisodeHandle) -> None:
-        self._tools = FileWorkspaceTools(self.service.solver_root(handle))
-
-    def _initial_observation(self) -> str:
-        return f"Workspace ready. Files:\n{self._require_tools().list_dir('.')}"
-
-    # -- tools (public → exposed to the policy) ------------------------------
-
-    def read_file(self, path: str) -> str:
-        """Read a UTF-8 text file from the workspace and return its contents.
-
-        Args:
-            path: Path to the file, relative to the workspace root.
-        """
-        out = self._safe(lambda: self._require_tools().read_file(path))
-        self._record("read_file", {"path": path}, out)
-        return out
-
-    def write_file(self, path: str, content: str) -> str:
-        """Create or overwrite a workspace file with the given contents.
-
-        Args:
-            path: Path to the file, relative to the workspace root.
-            content: The full text to write into the file.
-        """
-        out = self._safe(lambda: self._require_tools().write_file(path, content))
-        self._record("write_file", {"path": path, "content": content}, out)
-        return out
-
-    def list_dir(self, path: str = ".") -> str:
-        """List the entries of a workspace directory.
-
-        Args:
-            path: Directory to list, relative to the workspace root (defaults to root).
-        """
-        out = self._safe(lambda: self._require_tools().list_dir(path))
-        self._record("list_dir", {"path": path}, out)
-        return out
-
-    def apply_patch(self, path: str, find: str, replace: str) -> str:
-        """Replace exact text in a workspace file (use this for small edits).
-
-        Args:
-            path: Path to the file to edit, relative to the workspace root.
-            find: The exact text to search for in the file.
-            replace: The text to substitute in place of every match.
-        """
-        out = self._safe(lambda: self._require_tools().apply_patch(path, find, replace))
-        self._record("apply_patch", {"path": path, "find": find}, out)
-        return out
-
-    def run_tests(self, node_ids: str = "") -> str:
-        """Run the workspace's own pytest suite and return a text summary.
-
-        This runs only the tests visible in your workspace, never the held-out
-        grading suite.
-
-        Args:
-            node_ids: Space-separated pytest targets; empty runs the whole suite.
-        """
-        out = self._safe(lambda: self._run_tests(node_ids))
-        self._record("run_tests", {"node_ids": node_ids}, out)
-        return out
-
-    # -- internals (underscore → TRL skips these) ----------------------------
-
-    def _run_tests(self, node_ids: str) -> str:
-        surface = self._surface or {}
-        fn = surface.get("run_tests")
-        if not callable(fn):
-            return "error: this world exposes no run_tests tool"
-        targets = node_ids.split() or None
-        res = fn(targets)
-        ok = bool(res.get("ok"))
-        head = (
-            f"tests {'passed' if ok else 'failed'} "
-            f"(returncode={res.get('returncode')}, "
-            f"isolation={res.get('isolation')})"
-        )
-        stdout = str(res.get("stdout") or "").strip()
-        body = stdout[-_OUTPUT_TAIL:] if stdout else "(no output)"
-        return f"{head}\n{body}"
-
-    def _require_tools(self) -> FileWorkspaceTools:
-        if self._tools is None:
-            raise WorkspaceError("reset() has not been called")
-        return self._tools
+def _run_docker(*args: str, check: bool = True) -> None:
+    subprocess.run(["docker", *args], check=check, capture_output=True, timeout=60)
 
 
-class WebTargetEnv(EpisodeEnv):
-    """Web-target env: the policy probes a live HTTP service the episode boots.
-
-    Adds two tools — ``http_get`` (send a GET to the running target and read the
-    status + body) and ``submit`` (write the final answer to the episode's
-    ``result.json``, which the pack grades). The episode surface provides the
-    target's ``base_url``; each request hits the live server (and is logged
-    there), so the pack's held-out grade reads off the *real* interaction. Used
-    for the cyber webapp pack, where a rollout exploits a planted vulnerability
-    over HTTP and submits the value it exfiltrates.
-    """
-
-    _RESULT_FILE = "result.json"
-
-    def __init__(
-        self,
-        *,
-        service: EpisodeService,
-        snapshots: Mapping[str, Snapshot],
-        reward_fn: Callable[[EpisodeReport], Reward] = episode_reward,
-    ) -> None:
-        super().__init__(service=service, snapshots=snapshots, reward_fn=reward_fn)
-        self._base_url: str | None = None
-        self._solver_root: Path | None = None
-
-    def _setup(self, handle: EpisodeHandle) -> None:
-        surface = self._surface or {}
-        base_url = surface.get("base_url")
-        self._base_url = base_url if isinstance(base_url, str) else None
-        self._solver_root = Path(self.service.solver_root(handle))
-
-    def _initial_observation(self) -> str:
-        target = self._base_url or "(no web target exposed)"
-        return (
-            f"A live web service is running at {target}. Probe it with "
-            "http_get(path); call submit(content) when you have the answer."
-        )
-
-    # -- tools (public → exposed to the policy) ------------------------------
-
-    def http_get(self, path: str) -> str:
-        """Send an HTTP GET to the running target and return its status + body.
-
-        Args:
-            path: Request path including any query string (e.g. ``/items?id=1``),
-                resolved against the target's base URL.
-        """
-        out = self._safe(lambda: self._http_get(path))
-        self._record("http_get", {"path": path}, out)
-        return out
-
-    def submit(self, content: str) -> str:
-        """Submit your final answer; the held-out grader reads ``result.json``.
-
-        Args:
-            content: A JSON object carrying the requested field, e.g.
-                ``{"flag": "<the value you recovered>"}``.
-        """
-        out = self._safe(lambda: self._submit(content))
-        self._record("submit", {"content": content}, out)
-        return out
-
-    # -- internals (underscore → TRL skips these) ----------------------------
-
-    def _http_get(self, path: str) -> str:
-        if not self._base_url:
-            return "error: this world exposes no web target"
-        try:
-            with urlopen(Request(self._base_url + path), timeout=_HTTP_TIMEOUT) as r:
-                status, body = r.status, r.read().decode("utf-8", "replace")
-        except HTTPError as exc:
-            status, body = exc.code, exc.read().decode("utf-8", "replace")
-        return f"status={status}\n{body[-_OUTPUT_TAIL:]}"
-
-    def _submit(self, content: str) -> str:
-        if self._solver_root is None:
-            raise WorkspaceError("reset() has not been called")
-        (self._solver_root / self._RESULT_FILE).write_text(content, encoding="utf-8")
-        return f"submitted {len(content)} byte(s)"
-
-
-def build_grpo_dataset(
-    snapshot: Snapshot,
-    *,
-    repeat: int = 1,
-    tool_guide: str = _TOOL_GUIDE,
-) -> list[dict[str, Any]]:
+def build_grpo_dataset(snapshot: Snapshot, *, repeat: int = 1) -> list[dict[str, Any]]:
     """Turn a snapshot's tasks into GRPO prompt rows.
 
     One row per task (optionally ``repeat``-ed so a round has enough prompts):
-    ``{"prompt": [{"role": "user", "content": ...}], "snapshot_id", "task_id"}``.
-    ``snapshot_id`` / ``task_id`` ride along as dataset columns — TRL forwards
-    them to ``reset`` (which episode to start) and to the reward func, and they
-    tag the exported trajectory to the exact (possibly evolved) world. Torch-free
-    by design; the live example wraps the rows in a ``datasets.Dataset``.
-
-    ``tool_guide`` is the tool-usage block appended to each task instruction;
-    pass ``WEB_TOOL_GUIDE`` for the ``WebTargetEnv`` action surface.
+    ``{"prompt": [{"role": "user", "content": task.instruction}], "snapshot_id",
+    "task_id"}``. ``snapshot_id`` / ``task_id`` ride along as dataset columns —
+    TRL forwards them to ``reset`` (which episode to start) and to the reward
+    func, and they tag the exported trajectory to the exact (possibly evolved)
+    world. The policy sees the available tools via TRL's tool schemas (the chat
+    template), so the row carries only the task instruction. Torch-free; the live
+    example wraps the rows in a ``datasets.Dataset``.
     """
     rows: list[dict[str, Any]] = []
     for _ in range(max(1, repeat)):
         for task in snapshot.tasks:
             rows.append(
                 {
-                    "prompt": [
-                        {"role": "user", "content": _task_prompt(task, tool_guide)}
-                    ],
+                    "prompt": [{"role": "user", "content": task.instruction}],
                     "snapshot_id": snapshot.snapshot_id,
                     "task_id": task.id,
                 }
@@ -487,17 +327,18 @@ def build_grpo_dataset(
     return rows
 
 
-def _task_prompt(task: TaskSpec, tool_guide: str = _TOOL_GUIDE) -> str:
-    return f"{task.instruction}\n\n{tool_guide}"
-
-
-def make_reward_func() -> Callable[..., list[float]]:
+def make_reward_func(
+    collector: dict[tuple[str, str], list[EpisodeReport]] | None = None,
+) -> Callable[..., list[float]]:
     """Return a TRL-shaped ``reward_func(prompts, completions, ...)``.
 
     In the agentic path TRL passes the rollouts' ``environments``; this finalizes
-    each (lazily stopping + grading the episode) and returns
-    ``[env.reward, ...]`` in order. All reward logic is the pack's structured
-    grade shaped by ``episode_reward`` — the trainer only *reads* it.
+    each (lazily stopping + grading the episode) and returns ``[env.reward, ...]``
+    in order. All reward logic is the pack's structured grade shaped by
+    ``episode_reward`` — the trainer only *reads* it. When ``collector`` is given,
+    each graded report is also recorded under its ``(snapshot_id, task_id)``, so a
+    curriculum reads one round's reports back from a multi-world batch (the trainer
+    itself keeps only the last episode per env slot).
     """
 
     def reward_func(
@@ -511,28 +352,13 @@ def make_reward_func() -> Callable[..., list[float]]:
         rewards: list[float] = []
         for env in environments or ():
             env._finalize()
+            if collector is not None and env.report is not None:
+                key = (env.report.snapshot_id, env.report.task_id)
+                collector.setdefault(key, []).append(env.report)
             rewards.append(float(env.reward))
         return rewards
 
     return reward_func
-
-
-def _make_factory[E: EpisodeEnv](
-    pack: Pack,
-    snapshots: Sequence[Snapshot],
-    run_root: str | Path,
-    reward_fn: Callable[[EpisodeReport], Reward],
-    env_cls: type[E],
-) -> Callable[[], E]:
-    snap_map = {s.snapshot_id: s for s in snapshots}
-    base = Path(run_root)
-    base.mkdir(parents=True, exist_ok=True)
-
-    def factory() -> E:
-        service = EpisodeService(pack, base / f"env-{uuid.uuid4().hex[:8]}")
-        return env_cls(service=service, snapshots=snap_map, reward_fn=reward_fn)
-
-    return factory
 
 
 def make_environment_factory(
@@ -540,34 +366,43 @@ def make_environment_factory(
     snapshots: Sequence[Snapshot],
     run_root: str | Path,
     *,
+    tools: Sequence[Tool],
     reward_fn: Callable[[EpisodeReport], Reward] = episode_reward,
-) -> Callable[[], OpenRangeEnv]:
+    backing: Backing = Backing.PROCESS,
+    sandbox: bool = False,
+) -> Callable[[], EpisodeEnv]:
     """Build the zero-arg factory TRL calls once per rollout slot.
 
-    Each call gets its own ``EpisodeService`` under a unique subdir, so the N
-    envs in a GRPO generation batch are fully isolated. The factory closes over
-    one round's ``snapshots`` (often a single, current world); the curriculum
-    re-roots the next round by re-building the dataset + factory against the
-    evolved snapshot.
+    The caller (the user's harness) supplies ``tools`` — the action surface the
+    policy gets — bound to the world surface each ``reset``. Each factory call
+    gets its own ``EpisodeService`` under a unique subdir, so the N envs in a
+    GRPO generation batch are fully isolated. The factory closes over one round's
+    ``snapshots`` (often a single, current world); the curriculum re-roots the
+    next round by re-building the dataset + factory against the evolved snapshot.
+    ``backing`` picks how each rollout realizes its world — PROCESS by default;
+    CONTAINER (incl. the networked multi-service runtime) trains against the real
+    containerized target. ``sandbox=True`` runs each episode's tools in their own
+    throwaway :class:`AgentSandbox` (HTTP worlds need the CONTAINER backing so the
+    sandbox can join the target's network).
     """
-    return _make_factory(pack, snapshots, run_root, reward_fn, OpenRangeEnv)
+    snap_map = {s.snapshot_id: s for s in snapshots}
+    base = Path(run_root)
+    base.mkdir(parents=True, exist_ok=True)
+    tool_list = tuple(tools)
 
+    def factory() -> EpisodeEnv:
+        service = EpisodeService(
+            pack, base / f"env-{uuid.uuid4().hex[:8]}", backing=backing
+        )
+        return EpisodeEnv(
+            service=service,
+            snapshots=snap_map,
+            tools=tool_list,
+            reward_fn=reward_fn,
+            sandbox=sandbox,
+        )
 
-def make_web_environment_factory(
-    pack: Pack,
-    snapshots: Sequence[Snapshot],
-    run_root: str | Path,
-    *,
-    reward_fn: Callable[[EpisodeReport], Reward] = episode_reward,
-) -> Callable[[], WebTargetEnv]:
-    """Like ``make_environment_factory`` but yields ``WebTargetEnv`` rollouts.
-
-    For packs whose episode realizes a live web target (e.g. the cyber webapp
-    pack): each rollout boots its own isolated service + HTTP server, and the
-    policy acts through ``http_get`` / ``submit``. Pair with
-    ``build_grpo_dataset(..., tool_guide=WEB_TOOL_GUIDE)``.
-    """
-    return _make_factory(pack, snapshots, run_root, reward_fn, WebTargetEnv)
+    return factory
 
 
 def env_trajectory(env: EpisodeEnv) -> Trajectory:
@@ -580,6 +415,110 @@ def env_trajectory(env: EpisodeEnv) -> Trajectory:
     if env.report is None:
         raise RuntimeError("no completed episode to export; call reset() first")
     return episode_trajectory(env.report, env.turns)
+
+
+def make_grpo_rounds(
+    pack: Pack,
+    *,
+    model: Any,
+    args: Any,
+    tools: Sequence[Tool],
+    run_root: str | Path,
+    processing_class: Any = None,
+    peft_config: Any = None,
+    reward_fn: Callable[[EpisodeReport], Reward] = episode_reward,
+    backing: Backing = Backing.PROCESS,
+    sandbox: bool = False,
+) -> tuple[RunRound, RunRound]:
+    """A ``(train_round, eval_round)`` pair for
+    :func:`openrange.pool.run_pool_curriculum`, sharing one live model.
+
+    ``train_round`` drives one short ``trl.GRPOTrainer`` pass over the round's rows
+    and carries the model forward (``peft_config`` wraps it once). ``eval_round``
+    rolls the *same* mid-training model out over a held-out round and grades it under
+    a frozen update (``learning_rate`` 0), so the held-out pool measures
+    generalization without being trained on. Both return the graded reports keyed by
+    ``(snapshot_id, task_id)`` and re-root the env factory onto the round's
+    snapshots. ``args`` is a ``GRPOConfig`` whose ``max_steps`` bounds the round.
+    ``trl`` is imported here so importing :mod:`openrange_trl` stays torch-free.
+    """
+    from datasets import Dataset
+    from trl import GRPOTrainer
+
+    base = Path(run_root)
+    base.mkdir(parents=True, exist_ok=True)
+    holder: dict[str, Any] = {"model": model, "peft": peft_config}
+    frozen_args = copy.copy(args)
+    frozen_args.learning_rate = 0.0
+
+    def _round(
+        rows: list[PromptRow],
+        snapshots: list[Snapshot],
+        run_args: Any,
+        *,
+        update: bool,
+    ) -> RoundReports:
+        collector: dict[tuple[str, str], list[EpisodeReport]] = {}
+        factory = make_environment_factory(
+            pack,
+            snapshots,
+            base / uuid.uuid4().hex[:8],
+            tools=tools,
+            reward_fn=reward_fn,
+            backing=backing,
+            sandbox=sandbox,
+        )
+        trainer = GRPOTrainer(
+            model=holder["model"],
+            reward_funcs=[make_reward_func(collector)],
+            args=run_args,
+            train_dataset=Dataset.from_list(rows),
+            processing_class=processing_class,
+            environment_factory=factory,
+            peft_config=holder["peft"],
+        )
+        trainer.train()
+        if update:
+            holder["model"], holder["peft"] = trainer.model, None
+        return collector
+
+    def train_round(rows: list[PromptRow], snapshots: list[Snapshot]) -> RoundReports:
+        return _round(rows, snapshots, args, update=True)
+
+    def eval_round(rows: list[PromptRow], snapshots: list[Snapshot]) -> RoundReports:
+        return _round(rows, snapshots, frozen_args, update=False)
+
+    return train_round, eval_round
+
+
+def make_grpo_run_round(
+    pack: Pack,
+    *,
+    model: Any,
+    args: Any,
+    tools: Sequence[Tool],
+    run_root: str | Path,
+    processing_class: Any = None,
+    peft_config: Any = None,
+    reward_fn: Callable[[EpisodeReport], Reward] = episode_reward,
+    backing: Backing = Backing.PROCESS,
+    sandbox: bool = False,
+) -> RunRound:
+    """The training half of :func:`make_grpo_rounds` — a ``run_round`` that trains
+    one GRPO pass per round, for when no held-out eval is needed."""
+    train_round, _ = make_grpo_rounds(
+        pack,
+        model=model,
+        args=args,
+        tools=tools,
+        run_root=run_root,
+        processing_class=processing_class,
+        peft_config=peft_config,
+        reward_fn=reward_fn,
+        backing=backing,
+        sandbox=sandbox,
+    )
+    return train_round
 
 
 def reward_variance_policy(
@@ -615,3 +554,20 @@ def _report_scalar(report: EpisodeReportLike) -> float:
     # CurriculumPolicy takes the EpisodeReportLike Protocol, but the trainer only
     # emits concrete EpisodeReport; this contract fallback needs a fake to hit.
     return 1.0 if report.passed else 0.0  # pragma: no cover
+
+
+__all__ = [
+    "SANDBOX_LABEL",
+    "AgentSandbox",
+    "CommandResult",
+    "EpisodeEnv",
+    "SandboxError",
+    "Tool",
+    "build_grpo_dataset",
+    "env_trajectory",
+    "make_environment_factory",
+    "make_grpo_rounds",
+    "make_grpo_run_round",
+    "make_reward_func",
+    "reward_variance_policy",
+]

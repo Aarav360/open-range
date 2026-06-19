@@ -21,11 +21,53 @@ entirely.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 from graphschema import WorldGraph
+from openrange_pack_sdk import Backing
 
 from cyber_webapp.codegen import _realize_graph
 from cyber_webapp.codegen.entrypoint import APP_FILE_NAME, SEED_FILE_NAME
+from cyber_webapp.vulnerabilities import CATALOG
+
+# Exploit shapes whose blackbox solution needs a real OS filesystem/shell — a real
+# ``open()`` / ``sh -c`` — not the PROCESS backing's in-memory emulation. Under PROCESS
+# the loot file sits at a randomized path in an in-memory dict with no listing
+# primitive, so a blackbox agent cannot DISCOVER it (reward stays 0). The CONTAINER
+# backing's real fs/shell restores enumeration (``ls`` / globs), making these solvable.
+_REAL_SUBSTRATE_SHAPES = frozenset({"file_read", "code_exec"})
+
+
+def minimum_backing(graph: WorldGraph) -> Backing:
+    """The least-fidelity backing under which this world is blackbox-agent-solvable.
+
+    ``PROCESS`` for worlds whose vulns all leak in-band through the HTTP response
+    (sql_injection, idor, ssrf, …): those carry their own discovery channel. A world
+    with any file-read / code-exec vuln (path_traversal, xxe, command_injection, ssti)
+    needs ``CONTAINER`` — only a real filesystem/shell lets a blackbox agent enumerate
+    the randomized loot path it must read. Solvable-by-construction is unchanged either
+    way (cross-backing parity); this is about agent *reachability*, so a training
+    harness can pick the cheapest backing that still leaves the world winnable.
+    """
+    for vuln in graph.by_kind("vulnerability"):
+        entry = CATALOG.get(str(vuln.attrs.get("kind")))
+        if entry is not None and entry.shape in _REAL_SUBSTRATE_SHAPES:
+            return Backing.CONTAINER
+    return Backing.PROCESS
+
+
+def has_write_exec_surface(graph: WorldGraph) -> bool:
+    """True if any vuln has the ``code_exec`` shape (command_injection, ssti).
+
+    Such a world mutates its own container during an episode, so it can't be kept
+    warm and reused — its state would cross episodes.
+    """
+    for vuln in graph.by_kind("vulnerability"):
+        entry = CATALOG.get(str(vuln.attrs.get("kind")))
+        if entry is not None and entry.shape == "code_exec":
+            return True
+    return False
+
 
 # A fixed in-container port (the host maps it to an ephemeral port at run time, the way
 # the PROCESS backing binds port 0).
@@ -124,3 +166,40 @@ def image_files(graph: WorldGraph) -> dict[str, str]:
         APP_FILE_NAME: rendered[APP_FILE_NAME],
         SEED_FILE_NAME: rendered[SEED_FILE_NAME],
     }
+
+
+@dataclass(frozen=True)
+class ServiceImage:
+    """One service's container build context (the networked CONTAINER backing builds
+    one image per service node). ``name`` is the container/DNS name services reach each
+    other by; ``exposure`` decides whether the host publishes it (public) or it stays
+    reachable only on the container network (internal)."""
+
+    service_id: str
+    name: str
+    exposure: str
+    build_files: dict[str, str]
+
+
+def realize_services(graph: WorldGraph) -> list[ServiceImage]:
+    """Per-service build contexts: one image per service, each carrying only its own
+    endpoints + its own state (so the flag stays in the internal service that owns it
+    and never enters the public image). The networked runtime wires these on a container
+    network and publishes only the public service."""
+    dockerfile = _dockerfile(required_apt_packages(graph))
+    images: list[ServiceImage] = []
+    for service in graph.by_kind("service"):
+        rendered = _realize_graph(graph, frozenset({service.id}))
+        images.append(
+            ServiceImage(
+                service_id=service.id,
+                name=str(service.attrs.get("name", service.id)),
+                exposure=str(service.attrs.get("exposure", "internal")),
+                build_files={
+                    "Dockerfile": dockerfile,
+                    APP_FILE_NAME: rendered[APP_FILE_NAME],
+                    SEED_FILE_NAME: rendered[SEED_FILE_NAME],
+                },
+            )
+        )
+    return images

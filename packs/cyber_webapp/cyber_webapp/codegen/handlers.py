@@ -15,7 +15,10 @@ from cyber_webapp.vulnerabilities import render_vulnerability
 
 def build_handlers_and_routes(
     graph: WorldGraph,
+    only_services: frozenset[str] | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    # ``only_services`` restricts to one service's own endpoints — the per-service split
+    # that the networked CONTAINER backing realizes (each service is its own container).
     services_by_id: dict[str, Node] = {
         n.id: n for n in graph.nodes.values() if n.kind == "service"
     }
@@ -41,6 +44,8 @@ def build_handlers_and_routes(
         service_id = service_for_endpoint.get(endpoint_id)
         if service_id is None:
             continue
+        if only_services is not None and service_id not in only_services:
+            continue
         service = services_by_id[service_id]
         service_name = str(service.attrs.get("name", service_id))
         path = str(endpoint.attrs.get("path", "/"))
@@ -54,13 +59,24 @@ def build_handlers_and_routes(
             vuln_node = vulns_by_id[vuln_id]
             body = _render_vuln_body(vuln_node)
         else:
-            kind = str(service.attrs.get("kind", ""))
-            body = _default_handler_body(service_name, path, kind)
+            # A benign endpoint may carry an LLM-realized body (admitted by
+            # realize_service_surface) — prefer it over the flat default stub.
+            realized = endpoint.attrs.get("realized_handler")
+            if isinstance(realized, str) and realized.strip():
+                body = _extract_handle_body(realized)
+            else:
+                kind = str(service.attrs.get("kind", ""))
+                body = _default_handler_body(service_name, path, kind)
         docstring = f"Endpoint {service_name}{path}."
         handlers.append(
             {"name": handler_name, "body": body, "docstring": docstring},
         )
-        routes.append({"path": public_url, "handler": handler_name})
+        # Single app: every service shares one server, so internal services are
+        # namespaced by ``/svc/<name>`` (public_url). Per-service: each service is its
+        # own container serving on its own port, so it routes on the bare ``path`` and a
+        # caller reaches it at ``http://<service-name><path>``.
+        route_path = path if only_services is not None else public_url
+        routes.append({"path": route_path, "handler": handler_name})
     return handlers, routes
 
 
